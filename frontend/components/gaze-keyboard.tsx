@@ -10,6 +10,7 @@ import {
   keyCenter,
   nextCycle,
   pickGazeKey,
+  SNAP_ZONE,
   type Cycle,
   type KeyDef,
 } from "@/lib/keyboard";
@@ -859,6 +860,13 @@ function Keyboard({
                       isActiveCalib ? "bg-[#0b1220]/20" : "bg-[#d4a017]/35"
                     }`}
                     style={{ height: `${progress * 100}%` }}
+                  />
+                ) : null}
+                {!calibrating ? (
+                  <span
+                    aria-hidden
+                    className="pointer-events-none absolute rounded-xl border border-dashed border-white/15"
+                    style={{ inset: `${((1 - SNAP_ZONE) / 2) * 100}%` }}
                   />
                 ) : null}
                 <span className="relative flex flex-col items-center leading-none">

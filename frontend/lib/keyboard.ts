@@ -87,18 +87,21 @@ export function keyCenter(id: string, nodes: Map<string, HTMLElement>) {
   return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 }
 
-// Fraction of a key's size the gaze may drift past its edge before we let go
-// of it. Vertical gets more slack because the vertical estimate is noisier.
-const HOLD_MARGIN_X = 0.25;
-const HOLD_MARGIN_Y = 0.45;
-// Beyond this normalised distance from every key (e.g. reading the output
-// box), nothing is selected.
-const MAX_SNAP_DISTANCE = 2;
+// Snap zones, as a fraction of each key's width/height, centred on the key.
+// The pointer must enter the inner zone to grab a key, and keeps it until it
+// leaves the slightly larger release zone, which stops flicker at the edge.
+// Outside every zone nothing is selected.
+export const SNAP_ZONE = 0.55;
+const RELEASE_ZONE = 0.75;
 
-// Snaps the gaze point to the nearest key, measured in units of half the key
-// size so tall and wide keys are treated alike. The current key is kept while
-// the gaze stays inside its slightly enlarged box, which stops flicker at
-// borders.
+// Distance from the key centre in units of half the key size (Chebyshev), so
+// a value of 1 is the key's edge whatever its shape.
+function keyDistance(x: number, y: number, rect: DOMRect) {
+  const dx = (x - (rect.left + rect.width / 2)) / Math.max(rect.width / 2, 1);
+  const dy = (y - (rect.top + rect.height / 2)) / Math.max(rect.height / 2, 1);
+  return Math.max(Math.abs(dx), Math.abs(dy));
+}
+
 export function pickGazeKey(
   x: number,
   y: number,
@@ -107,30 +110,12 @@ export function pickGazeKey(
 ) {
   if (currentId) {
     const rect = nodes.get(currentId)?.getBoundingClientRect();
-    if (
-      rect &&
-      x >= rect.left - rect.width * HOLD_MARGIN_X &&
-      x <= rect.right + rect.width * HOLD_MARGIN_X &&
-      y >= rect.top - rect.height * HOLD_MARGIN_Y &&
-      y <= rect.bottom + rect.height * HOLD_MARGIN_Y
-    ) {
-      return currentId;
-    }
+    if (rect && keyDistance(x, y, rect) <= RELEASE_ZONE) return currentId;
   }
 
-  let bestId: string | null = null;
-  let bestDist = Infinity;
   for (const key of KEY_ROWS.flat()) {
     const rect = nodes.get(key.id)?.getBoundingClientRect();
-    if (!rect) continue;
-    const dx = (x - (rect.left + rect.width / 2)) / Math.max(rect.width / 2, 1);
-    const dy = (y - (rect.top + rect.height / 2)) / Math.max(rect.height / 2, 1);
-    const dist = Math.max(Math.abs(dx), Math.abs(dy));
-    if (dist < bestDist) {
-      bestDist = dist;
-      bestId = key.id;
-    }
+    if (rect && keyDistance(x, y, rect) <= SNAP_ZONE) return key.id;
   }
-
-  return bestDist > MAX_SNAP_DISTANCE ? null : bestId;
+  return null;
 }
