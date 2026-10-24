@@ -32,6 +32,11 @@ export function applyKey(text: string, key: KeyDef) {
   return text + (key.insert ?? key.label.toLowerCase());
 }
 
+// Removes the last word together with any spaces after it.
+export function deleteLastWord(text: string) {
+  return text.replace(/\S*\s*$/, "");
+}
+
 export type Cycle = { keyId: string; index: number; at: number };
 
 // Multi-tap: re-firing the same key within the window replaces the pending
@@ -115,15 +120,17 @@ export function pickGazeKey(
   y: number,
   currentId: string | null,
   nodes: Map<string, HTMLElement>,
+  // Only keys passing this are considered (e.g. the pause-panel keys).
+  allow: (id: string) => boolean = () => true,
 ) {
-  if (currentId) {
+  if (currentId && allow(currentId)) {
     const node = nodes.get(currentId);
     if (node && keyDistance(x, y, node) <= RELEASE_ZONE) return currentId;
   }
 
   // Every registered key, including suggestions and the scroll strips.
   for (const [id, node] of nodes) {
-    if (keyDistance(x, y, node) <= SNAP_ZONE) return id;
+    if (allow(id) && keyDistance(x, y, node) <= SNAP_ZONE) return id;
   }
   return null;
 }

@@ -1,9 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   applyKey,
   CALIBRATION_KEYS,
+  deleteLastWord,
   findKey,
   HEAD_CALIBRATION_KEYS,
   KEY_ROWS,
@@ -17,6 +25,7 @@ import {
   createFaceLandmarker,
   HeadTracker,
   type EyeOpenness,
+  type HeadPose,
 } from "@/lib/head";
 import { speakText } from "@/lib/speech";
 import { AddVoice } from "@/lib/voice";
@@ -41,42 +50,64 @@ const DWELL_MS = 900;
 const CYCLE_MS = 800;
 // Keeping the pointer on a key presses it again at this interval.
 const REPEAT_MS = 900;
+// Adaptive delete: each repeat of a held backspace comes BACKSPACE_SPEEDUP
+// times sooner than the last (floored at BACKSPACE_MIN_MS); after
+// BACKSPACE_WORD_AFTER repeats it deletes whole words every BACKSPACE_WORD_MS.
+const BACKSPACE_SPEEDUP = 0.75;
+const BACKSPACE_MIN_MS = 150;
+const BACKSPACE_WORD_AFTER = 8;
+const BACKSPACE_WORD_MS = 400;
+// Shows a corner button that fills the box with random words, for testing.
+const DEBUG_TOOLS = true;
 const MULTITAP_MS = 900;
 const SWITCH_MS = 160;
 const GRACE_MS = 280;
 const CLICKS_PER_POINT = 5;
 const MEASURE_MS = 5000;
 const MEASURE_KEY = CALIBRATION_KEYS[CALIBRATION_KEYS.length - 1];
-// Head calibration: one click per key, then hold still while poses record.
+// Head calibration is hands-free: a key records once the head has turned
+// toward it and held still (pose within STILL_TOLERANCE over
+// STILL_WINDOW_MS) for STILL_MS, then for CAPTURE_MS more. Moving resets it.
+const STILL_WINDOW_MS = 400;
+const STILL_TOLERANCE = 0.02;
+const STILL_MS = 600;
 const CAPTURE_MS = 1000;
-const SETTLE_MS = 250;
 const MIN_CAPTURE_SAMPLES = 8;
-// Wink calibration: after clicking Start, wait for the user to settle into
-// the pose, then record for WINK_CAPTURE_MS.
+// The first (centre) key waits this long so the user can settle; later keys
+// instead require the head to have turned at least MIN_TURN from the last
+// key, so a still head can't be recorded against the wrong target.
+const FIRST_POINT_DELAY_MS = 1500;
+const MIN_TURN = 0.04;
+// Wink calibration runs on a timer: get ready, close the eye, then record.
+// A failed step retries after WINK_RETRY_MS; after WINK_MAX_ATTEMPTS it
+// falls back to the default threshold so nobody gets stuck.
+const WINK_READY_MS = 2000;
 const WINK_SETTLE_MS = 700;
 const WINK_CAPTURE_MS = 1200;
+const WINK_TOTAL_MS = WINK_READY_MS + WINK_SETTLE_MS + WINK_CAPTURE_MS;
+const WINK_RETRY_MS = 2500;
+const WINK_MAX_ATTEMPTS = 3;
 const WINK_STEPS = [
   {
     id: "open",
     title: "Both eyes open",
-    instruction: "Look at the screen with both eyes open and relaxed.",
+    instruction: "Keep both eyes open and relaxed.",
   },
   {
     id: "left",
     title: "Wink your left eye",
-    instruction: "Close only your LEFT eye and hold it until the bar fills.",
+    instruction: "Close only your LEFT eye and hold it.",
   },
   {
     id: "right",
     title: "Wink your right eye",
-    instruction: "Close only your RIGHT eye and hold it until the bar fills.",
+    instruction: "Close only your RIGHT eye and hold it.",
   },
 ] as const;
 // Action keys beside the output box. They snap and dwell like the keypad but
 // never repeat when held.
 const CLEAR_KEY: KeyDef = { id: "clear", label: "Clear" };
 const SPEAK_KEY: KeyDef = { id: "speak", label: "Read aloud" };
-const ACTION_KEYS = [CLEAR_KEY, SPEAK_KEY];
 // Full-width snap strips along the top and bottom of the output box. Holding
 // one for SCROLL_DELAY_MS scrolls the box at SCROLL_SPEED px/s.
 const SCROLL_UP_KEY: KeyDef = { id: "scroll-up", label: "Scroll up" };
@@ -87,13 +118,33 @@ const SCROLL_DIRECTION: Record<string, number> = {
 };
 const SCROLL_DELAY_MS = 400;
 const SCROLL_SPEED = 60;
+// Dwell buttons for the calibration result and the pause panel.
+const START_TYPING_KEY: KeyDef = { id: "start-typing", label: "Start typing" };
+const RECALIBRATE_KEY: KeyDef = { id: "recalibrate", label: "Recalibrate" };
+const CONTROL_KEYS = [
+  CLEAR_KEY,
+  SPEAK_KEY,
+  SCROLL_UP_KEY,
+  SCROLL_DOWN_KEY,
+  START_TYPING_KEY,
+  RECALIBRATE_KEY,
+];
+// Keys that act once however long you keep pointing at them.
+const ONCE_KEY_IDS = new Set([
+  CLEAR_KEY.id,
+  SPEAK_KEY.id,
+  START_TYPING_KEY.id,
+  RECALIBRATE_KEY.id,
+]);
 // What still responds to the pointer while paused.
 const PAUSE_KEY_IDS = new Set([
   CLEAR_KEY.id,
   SPEAK_KEY.id,
   SCROLL_UP_KEY.id,
   SCROLL_DOWN_KEY.id,
+  RECALIBRATE_KEY.id,
 ]);
+const RESULT_KEY_IDS = new Set([START_TYPING_KEY.id, RECALIBRATE_KEY.id]);
 const SUGGESTION_COUNT = 4;
 const SUGGESTION_PREFIX = "suggest-";
 
@@ -128,6 +179,8 @@ type DwellState = {
   pendingSince: number;
   fired: boolean;
   lastFire: number;
+  // Repeats since the first press while held on the same key.
+  repeats: number;
 };
 
 function emptyDwell(): DwellState {
@@ -139,6 +192,7 @@ function emptyDwell(): DwellState {
     pendingSince: 0,
     fired: false,
     lastFire: 0,
+    repeats: 0,
   };
 }
 
@@ -159,14 +213,13 @@ export function GazeKeyboard() {
   const [clicks, setClicks] = useState(0);
   const [measureProgress, setMeasureProgress] = useState(0);
   const [accuracy, setAccuracy] = useState<number | null>(null);
-  const [capturing, setCapturing] = useState(false);
   const [captureProgress, setCaptureProgress] = useState(0);
   const [entry, setEntry] = useState<Entry>("predictive");
   const [digits, setDigits] = useState("");
   const [dict, setDict] = useState<Dictionary | null>(null);
   const [paused, setPaused] = useState(false);
   const [winkStep, setWinkStep] = useState(0);
-  const [winkCapturing, setWinkCapturing] = useState(false);
+  const [winkFallback, setWinkFallback] = useState(false);
   const [winkProgress, setWinkProgress] = useState(0);
   const [winkError, setWinkError] = useState<string | null>(null);
 
@@ -183,9 +236,12 @@ export function GazeKeyboard() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const trackerRef = useRef<HeadTracker | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const capturingRef = useRef(false);
-  const captureStarted = useRef(0);
-  const captureCount = useRef(0);
+  // Hands-free head calibration state for the current key.
+  const poseWindow = useRef<Array<HeadPose & { t: number }>>([]);
+  const stillSince = useRef(0);
+  const pointSamples = useRef<HeadPose[]>([]);
+  const pointShownAt = useRef(0);
+  const lastPointPose = useRef<HeadPose | null>(null);
   const faceOkRef = useRef(false);
   const entryRef = useRef<Entry>("predictive");
   const digitsRef = useRef("");
@@ -195,12 +251,12 @@ export function GazeKeyboard() {
   const outputRef = useRef<HTMLParagraphElement>(null);
   const textRef = useRef("");
   const winkStepRef = useRef(0);
-  const winkCapturingRef = useRef(false);
+  const winkAttempts = useRef(0);
+  const winkRetryAt = useRef(0);
   const winkCaptureStart = useRef(0);
   const winkSamples = useRef<EyeOpenness[]>([]);
-  // Where wink calibration goes next: the accuracy check during the first
-  // calibration, or straight back to typing when re-run from the header.
-  const winkReturnRef = useRef<"measure" | "typing">("measure");
+  // Actions defined after typeKey that its dwell keys need to trigger.
+  const actionsRef = useRef({ startTyping: () => {}, recalibrate: () => {} });
 
   phaseRef.current = phase;
   modeRef.current = mode;
@@ -226,7 +282,8 @@ export function GazeKeyboard() {
     setDigits(next);
   }, []);
 
-  const typeKey = useCallback((key: KeyDef, continuing: boolean) => {
+  // `wholeWord` makes backspace delete a word (adaptive delete).
+  const typeKey = useCallback((key: KeyDef, continuing: boolean, wholeWord = false) => {
     setFiredKey(key.id);
     window.setTimeout(() => {
       setFiredKey((current) => (current === key.id ? null : current));
@@ -237,6 +294,14 @@ export function GazeKeyboard() {
       setPending(null);
       setSequence("");
       setText("");
+      return;
+    }
+    if (key.id === START_TYPING_KEY.id) {
+      actionsRef.current.startTyping();
+      return;
+    }
+    if (key.id === RECALIBRATE_KEY.id) {
+      actionsRef.current.recalibrate();
       return;
     }
     if (key.id === SPEAK_KEY.id) {
@@ -258,7 +323,7 @@ export function GazeKeyboard() {
         return;
       }
       if (key.id === "backspace" && digitsRef.current) {
-        setSequence(digitsRef.current.slice(0, -1));
+        setSequence(wholeWord ? "" : digitsRef.current.slice(0, -1));
         return;
       }
       commitComposing();
@@ -278,14 +343,16 @@ export function GazeKeyboard() {
     } else {
       cycleRef.current = null;
       setPending(null);
-      setText((current) => applyKey(current, key));
+      setText((current) =>
+        wholeWord && key.id === "backspace"
+          ? deleteLastWord(current)
+          : applyKey(current, key),
+      );
     }
   }, [commitComposing, setSequence]);
 
   const resolveKey = useCallback((id: string) => {
-    const action = [...ACTION_KEYS, SCROLL_UP_KEY, SCROLL_DOWN_KEY].find(
-      (key) => key.id === id,
-    );
+    const action = CONTROL_KEYS.find((key) => key.id === id);
     if (action) return action;
     if (!id.startsWith(SUGGESTION_PREFIX)) return findKey(id);
     return suggestionsRef.current.find((key) => key.id === id) ?? null;
@@ -302,22 +369,36 @@ export function GazeKeyboard() {
   );
 
   // Suggestions and action keys act once, so holding them must not repeat.
+  // Backspace speeds up the longer it's held (see BACKSPACE_*).
   const holdInterval = useCallback(
-    (key: KeyDef | null) => {
+    (key: KeyDef | null, repeats = 0) => {
       if (!key || key.id.startsWith(SUGGESTION_PREFIX)) return null;
-      if (ACTION_KEYS.includes(key)) return null;
+      if (ONCE_KEY_IDS.has(key.id)) return null;
+      if (key.id === "backspace") {
+        if (repeats >= BACKSPACE_WORD_AFTER) return BACKSPACE_WORD_MS;
+        return Math.max(
+          BACKSPACE_MIN_MS,
+          REPEAT_MS * BACKSPACE_SPEEDUP ** repeats,
+        );
+      }
       return cyclesOnHold(key) ? CYCLE_MS : REPEAT_MS;
     },
     [cyclesOnHold],
   );
 
-  // `paused` limits the pointer to the keys in PAUSE_KEY_IDS.
+  // `allowed`, if given, limits which keys the pointer can select (e.g. only
+  // the pause-panel keys while paused).
   const applyGazePoint = useCallback(
-    (point: Point, paused = false) => {
+    (point: Point, allowed?: Set<string>) => {
       const now = performance.now();
       const state = dwell.current;
-      let hit = pickGazeKey(point.x, point.y, state.keyId, keyNodes.current);
-      if (paused && hit && !PAUSE_KEY_IDS.has(hit)) hit = null;
+      const hit = pickGazeKey(
+        point.x,
+        point.y,
+        state.keyId,
+        keyNodes.current,
+        allowed ? (id) => allowed.has(id) : undefined,
+      );
       const scrollDir = hit ? SCROLL_DIRECTION[hit] : undefined;
 
       if (hit && hit === state.keyId && scrollDir) {
@@ -333,10 +414,11 @@ export function GazeKeyboard() {
         state.leftAt = null;
         state.pendingId = null;
         const key = resolveKey(hit);
-        const interval = holdInterval(key);
+        const interval = holdInterval(key, state.repeats);
         if (key && !state.fired && now - state.since >= DWELL_MS) {
           state.fired = true;
           state.lastFire = now;
+          state.repeats = 0;
           typeKey(key, false);
         } else if (
           key &&
@@ -345,8 +427,13 @@ export function GazeKeyboard() {
           now - state.lastFire >= interval
         ) {
           state.lastFire = now;
+          state.repeats += 1;
           // Multi-tap keys cycle their letters; everything else repeats.
-          typeKey(key, cyclesOnHold(key));
+          typeKey(
+            key,
+            cyclesOnHold(key),
+            state.repeats > BACKSPACE_WORD_AFTER,
+          );
         }
       } else if (hit && hit !== state.keyId) {
         if (state.pendingId !== hit) {
@@ -359,6 +446,7 @@ export function GazeKeyboard() {
           state.leftAt = null;
           state.pendingId = null;
           state.fired = false;
+          state.repeats = 0;
         }
       } else if (!hit && state.keyId) {
         if (state.leftAt === null) state.leftAt = now;
@@ -377,7 +465,10 @@ export function GazeKeyboard() {
         } else if (shown && !dwell.current.fired) {
           fill = (now - dwell.current.since) / DWELL_MS;
         } else if (shown) {
-          const interval = holdInterval(resolveKey(shown));
+          const interval = holdInterval(
+            resolveKey(shown),
+            dwell.current.repeats,
+          );
           if (interval !== null) {
             fill = (now - dwell.current.lastFire) / interval;
           }
@@ -415,7 +506,11 @@ export function GazeKeyboard() {
       if (!point) return;
       const current = phaseRef.current;
       if (current === "typing") {
-        applyGazePoint(point, pausedRef.current);
+        applyGazePoint(point, pausedRef.current ? PAUSE_KEY_IDS : undefined);
+        return;
+      }
+      if (current === "result") {
+        applyGazePoint(point, RESULT_KEY_IDS);
         return;
       }
       if (current === "measure") measured.current.push(point);
@@ -432,8 +527,11 @@ export function GazeKeyboard() {
   const beginCalibration = useCallback(async (forMode: InputMode) => {
     if (forMode === "head") trackerRef.current?.reset();
     else await resetCalibration();
-    capturingRef.current = false;
-    setCapturing(false);
+    poseWindow.current = [];
+    stillSince.current = 0;
+    pointSamples.current = [];
+    pointShownAt.current = performance.now();
+    lastPointPose.current = null;
     setCaptureProgress(0);
     dwell.current = emptyDwell();
     clicksRef.current = 0;
@@ -454,26 +552,18 @@ export function GazeKeyboard() {
     setPhase("measure");
   }, []);
 
-  const startWinkCalibration = useCallback((returnTo: "measure" | "typing") => {
-    winkReturnRef.current = returnTo;
+  const startWinkCalibration = useCallback(() => {
     winkStepRef.current = 0;
-    winkCapturingRef.current = false;
-    setWinkStep(0);
-    setWinkCapturing(false);
-    setWinkProgress(0);
-    setWinkError(null);
-    setGaze(null);
-    setPhase("winkCalibrate");
-  }, []);
-
-  const startWinkCapture = useCallback(() => {
-    if (winkCapturingRef.current) return;
+    winkAttempts.current = 0;
+    winkRetryAt.current = 0;
     winkSamples.current = [];
     winkCaptureStart.current = performance.now();
-    winkCapturingRef.current = true;
-    setWinkCapturing(true);
+    setWinkStep(0);
     setWinkProgress(0);
     setWinkError(null);
+    setWinkFallback(false);
+    setGaze(null);
+    setPhase("winkCalibrate");
   }, []);
 
   const stopHead = useCallback(() => {
@@ -556,26 +646,22 @@ export function GazeKeyboard() {
     setPhase("typing");
   }, [setPausedState]);
 
-  const finishWinkCalibration = useCallback(() => {
-    winkCapturingRef.current = false;
-    setWinkCapturing(false);
-    if (winkReturnRef.current === "measure") startMeasure();
-    else startTyping();
-  }, [startMeasure, startTyping]);
+  useEffect(() => {
+    actionsRef.current = {
+      startTyping,
+      recalibrate: () => void beginCalibration(modeRef.current),
+    };
+  }, [beginCalibration, startTyping]);
 
   const onKeyClick = useCallback(
     (key: KeyDef) => {
       const current = phaseRef.current;
-      if (current === "calibrate" && modeRef.current === "head") {
-        if (key.id !== HEAD_CALIBRATION_KEYS[activePointRef.current]) return;
-        if (capturingRef.current) return;
-        captureStarted.current = 0;
-        captureCount.current = 0;
-        capturingRef.current = true;
-        setCapturing(true);
-        setCaptureProgress(0);
+      if (current === "result" && RESULT_KEY_IDS.has(key.id)) {
+        typeKey(key, false);
         return;
       }
+      // Head calibration is hands-free; clicks only drive eye calibration.
+      if (current === "calibrate" && modeRef.current === "head") return;
       if (current === "calibrate") {
         if (key.id !== CALIBRATION_KEYS[activePointRef.current]) return;
         const target = keyCenter(key.id, keyNodes.current);
@@ -647,32 +733,53 @@ export function GazeKeyboard() {
         }
       }
       if (phaseRef.current === "winkCalibrate") {
-        if (!winkCapturingRef.current || !detected.fresh) return;
-        const elapsed = performance.now() - winkCaptureStart.current;
-        if (elapsed >= WINK_SETTLE_MS && detected.eyes) {
+        // Timed by the clock, not by camera frames, so the bar always moves;
+        // if frames stall, the step simply fails and retries.
+        const now = performance.now();
+        if (winkRetryAt.current) {
+          if (now < winkRetryAt.current) return;
+          winkRetryAt.current = 0;
+          winkSamples.current = [];
+          winkCaptureStart.current = now;
+          setWinkError(null);
+        }
+        const elapsed = now - winkCaptureStart.current;
+        if (
+          detected.fresh &&
+          detected.eyes &&
+          elapsed >= WINK_READY_MS + WINK_SETTLE_MS
+        ) {
           winkSamples.current.push(detected.eyes);
         }
-        setWinkProgress(Math.min(1, elapsed / (WINK_SETTLE_MS + WINK_CAPTURE_MS)));
-        if (elapsed < WINK_SETTLE_MS + WINK_CAPTURE_MS) return;
+        setWinkProgress(Math.min(1, elapsed / WINK_TOTAL_MS));
+        if (elapsed < WINK_TOTAL_MS) return;
 
-        winkCapturingRef.current = false;
-        setWinkCapturing(false);
         const step = WINK_STEPS[winkStepRef.current];
         const result =
           step.id === "open"
             ? tracker.calibrateWinkOpen(winkSamples.current)
             : tracker.calibrateWink(step.id, winkSamples.current);
         if (!result.ok) {
-          setWinkError(result.reason);
-          return;
+          winkAttempts.current += 1;
+          if (winkAttempts.current < WINK_MAX_ATTEMPTS) {
+            setWinkError(`${result.reason} Retrying…`);
+            winkRetryAt.current = now + WINK_RETRY_MS;
+            return;
+          }
+          // Out of attempts: keep the default threshold for this step.
+          setWinkFallback(true);
         }
         const next = winkStepRef.current + 1;
         if (next >= WINK_STEPS.length) {
-          finishWinkCalibration();
+          startMeasure();
           return;
         }
         winkStepRef.current = next;
+        winkAttempts.current = 0;
+        winkSamples.current = [];
+        winkCaptureStart.current = now;
         setWinkStep(next);
+        setWinkError(null);
         setWinkProgress(0);
         return;
       }
@@ -683,27 +790,60 @@ export function GazeKeyboard() {
         if (point) onGazeRef.current(point);
         return;
       }
-      if (!capturingRef.current) return;
-
       const target = keyCenter(
         HEAD_CALIBRATION_KEYS[activePointRef.current],
         keyNodes.current,
       );
       if (!target) return;
       const now = performance.now();
-      if (captureStarted.current === 0) captureStarted.current = now;
-      const elapsed = now - captureStarted.current;
-      if (elapsed >= SETTLE_MS) {
-        tracker.addSample(detected.pose, target);
-        captureCount.current += 1;
+      const pose = detected.pose;
+      const recent = poseWindow.current;
+      recent.push({ ...pose, t: now });
+      while (recent.length && recent[0].t < now - STILL_WINDOW_MS) recent.shift();
+
+      const meanYaw = recent.reduce((sum, p) => sum + p.yaw, 0) / recent.length;
+      const meanPitch = recent.reduce((sum, p) => sum + p.pitch, 0) / recent.length;
+      const still =
+        recent[0].t <= now - STILL_WINDOW_MS * 0.8 &&
+        recent.every(
+          (p) =>
+            Math.abs(p.yaw - meanYaw) < STILL_TOLERANCE &&
+            Math.abs(p.pitch - meanPitch) < STILL_TOLERANCE,
+        );
+      const last = lastPointPose.current;
+      const turned = last
+        ? Math.hypot(pose.yaw - last.yaw, pose.pitch - last.pitch) >= MIN_TURN
+        : now - pointShownAt.current >= FIRST_POINT_DELAY_MS;
+
+      if (!still || !turned) {
+        if (stillSince.current !== 0) {
+          stillSince.current = 0;
+          pointSamples.current = [];
+          setCaptureProgress(0);
+        }
+        return;
       }
-      setCaptureProgress(Math.min(1, elapsed / CAPTURE_MS));
-      if (elapsed < CAPTURE_MS || captureCount.current < MIN_CAPTURE_SAMPLES) {
+      if (stillSince.current === 0) stillSince.current = now;
+      const held = now - stillSince.current;
+      if (held >= STILL_MS) pointSamples.current.push(pose);
+      setCaptureProgress(Math.min(1, held / (STILL_MS + CAPTURE_MS)));
+      if (
+        held < STILL_MS + CAPTURE_MS ||
+        pointSamples.current.length < MIN_CAPTURE_SAMPLES
+      ) {
         return;
       }
 
-      capturingRef.current = false;
-      setCapturing(false);
+      for (const sample of pointSamples.current) tracker.addSample(sample, target);
+      const samples = pointSamples.current;
+      lastPointPose.current = {
+        yaw: samples.reduce((sum, p) => sum + p.yaw, 0) / samples.length,
+        pitch: samples.reduce((sum, p) => sum + p.pitch, 0) / samples.length,
+      };
+      stillSince.current = 0;
+      pointSamples.current = [];
+      poseWindow.current = [];
+      pointShownAt.current = now;
       setCaptureProgress(0);
       const nextIndex = activePointRef.current + 1;
       if (nextIndex < HEAD_CALIBRATION_KEYS.length) {
@@ -716,17 +856,17 @@ export function GazeKeyboard() {
         setPhase("error");
         return;
       }
-      startWinkCalibration("measure");
+      startWinkCalibration();
     };
 
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
   }, [
     chooseEntry,
-    finishWinkCalibration,
     mode,
     phase,
     setPausedState,
+    startMeasure,
     startWinkCalibration,
   ]);
 
@@ -796,6 +936,19 @@ export function GazeKeyboard() {
   useEffect(() => {
     textRef.current = text;
   }, [text]);
+
+  // DEBUG_TOOLS: append ~40 random common words to test deleting/scrolling.
+  const addDebugWords = useCallback(() => {
+    const pool = dictRef.current?.entries.slice(0, 2000).map((e) => e.word) ?? [
+      "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+    ];
+    const words = Array.from(
+      { length: 40 },
+      () => pool[Math.floor(Math.random() * pool.length)],
+    );
+    commitComposing();
+    setText((current) => current + words.join(" ") + " ");
+  }, [commitComposing]);
 
   const actionKey = (key: KeyDef) => (
     <KeyButton
@@ -940,13 +1093,13 @@ export function GazeKeyboard() {
             <CalibrationHeader
               mode={mode}
               phase={phase}
-              capturing={capturing}
+              capturing={captureProgress > 0}
               activePoint={activePoint}
               clicks={clicks}
               faceOk={faceOk}
               accuracy={accuracy}
-              onStart={startTyping}
-              onRecalibrate={() => beginCalibration(mode)}
+              winkFallback={winkFallback}
+              renderKey={actionKey}
             />
           )}
 
@@ -978,29 +1131,24 @@ export function GazeKeyboard() {
               setKeyNode={setKeyNode}
             />
           </div>
-          {phase === "typing" ? (
-            <div className="fixed right-3 bottom-0.5 z-30 flex gap-4 text-[11px] text-[#c8c0b0]/70">
-              {mode !== "head" ? (
-                <button type="button" onClick={() => setPausedState(!paused)}>
-                  {paused ? "Resume" : "Pause"}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => startWinkCalibration("typing")}
-                >
-                  Calibrate winks
-                </button>
-              )}
-              {mode !== "mouse" ? (
-                <button type="button" onClick={() => beginCalibration(mode)}>
-                  Recalibrate
-                </button>
-              ) : null}
+          {DEBUG_TOOLS && phase === "typing" ? (
+            <button
+              type="button"
+              onClick={addDebugWords}
+              className="fixed bottom-0.5 left-3 z-30 text-[11px] text-[#c8c0b0]/70"
+            >
+              Debug: add words
+            </button>
+          ) : null}
+          {phase === "typing" && mode !== "head" ? (
+            <div className="fixed right-3 bottom-0.5 z-30 text-[11px] text-[#c8c0b0]/70">
+              <button type="button" onClick={() => setPausedState(!paused)}>
+                {paused ? "Resume" : "Pause"}
+              </button>
             </div>
           ) : null}
           {paused && phase === "typing" ? (
-            <div className="pointer-events-none fixed inset-x-0 bottom-[30vh] z-30 flex justify-center px-4">
+            <div className="fixed inset-x-0 bottom-[22vh] z-30 flex justify-center px-4">
               <div className="rounded-3xl border border-[#d4a017]/60 bg-[#0b1220]/90 px-8 py-5 text-center shadow-2xl">
                 <p className="text-sm tracking-[0.25em] text-[#d4a017] uppercase">
                   Paused
@@ -1010,6 +1158,11 @@ export function GazeKeyboard() {
                     ? "Wink your left eye to resume."
                     : "Press Resume to keep typing."}
                 </p>
+                {mode !== "mouse" ? (
+                  <div className="mx-auto mt-4 flex h-20 w-64">
+                    {actionKey(RECALIBRATE_KEY)}
+                  </div>
+                ) : null}
               </div>
             </div>
           ) : null}
@@ -1019,16 +1172,13 @@ export function GazeKeyboard() {
       {phase === "winkCalibrate" ? (
         <WinkCalibration
           step={winkStep}
-          capturing={winkCapturing}
           progress={winkProgress}
           error={winkError}
           faceOk={faceOk}
-          onStart={startWinkCapture}
-          onSkip={finishWinkCalibration}
         />
       ) : null}
 
-      {(phase === "typing" || calibrating) && gaze ? (
+      {(phase === "typing" || phase === "result" || calibrating) && gaze ? (
         <div
           className={`pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[#d4a017] transition-[left,top] duration-150 ease-out ${
             gaze.snapped ? "size-6 bg-[#d4a017]/40" : "size-4 bg-[#d4a017]/15 opacity-60"
@@ -1048,8 +1198,8 @@ function CalibrationHeader({
   clicks,
   faceOk,
   accuracy,
-  onStart,
-  onRecalibrate,
+  winkFallback,
+  renderKey,
 }: {
   mode: InputMode;
   phase: Phase;
@@ -1058,19 +1208,19 @@ function CalibrationHeader({
   clicks: number;
   faceOk: boolean;
   accuracy: number | null;
-  onStart: () => void;
-  onRecalibrate: () => void;
+  winkFallback: boolean;
+  renderKey: (key: KeyDef) => ReactNode;
 }) {
   const head = mode === "head";
   let eyebrow = `Calibration ${activePoint + 1} / ${calibrationKeys(mode).length}`;
   let title = head
     ? capturing
       ? "Hold still, facing that key."
-      : "Turn your face toward the highlighted key, then click it."
+      : "Turn your face toward the highlighted key and hold still."
     : `Look at the highlighted key and click it ${CLICKS_PER_POINT} times.`;
   let detail = head
     ? faceOk
-      ? "Aim with your nose, like a laser pointer. Small, comfortable head turns are enough."
+      ? "Aim with your nose, like a laser pointer. It records by itself once you hold still."
       : "No face detected. Move into the camera's view."
     : faceOk
       ? `Keep your eyes on the key while you click. ${clicks} / ${CLICKS_PER_POINT} clicks.`
@@ -1081,14 +1231,17 @@ function CalibrationHeader({
     title = head
       ? "Keep facing the highlighted key for 5 seconds."
       : "Stare at the highlighted key for 5 seconds.";
-    detail = "Don't move the mouse. We're checking how close the predictions land.";
+    detail = "Hold still. We're checking how close the pointer lands.";
   } else if (phase === "result") {
     eyebrow = "Calibration done";
     title = `Accuracy: ${accuracy ?? 0}%`;
     detail =
       (accuracy ?? 0) >= 70
-        ? "Good enough to type. Recalibrate if keys feel off."
+        ? "Good enough to type. Point at a button to continue."
         : "That's low. Check your lighting and head position, then recalibrate.";
+    if (winkFallback) {
+      detail += " Some winks couldn't be calibrated, so they use the default.";
+    }
   }
 
   return (
@@ -1101,21 +1254,9 @@ function CalibrationHeader({
         <p className="mt-1 text-[#c8c0b0]">{detail}</p>
       </div>
       {phase === "result" ? (
-        <div className="flex gap-3">
-          <button
-            type="button"
-            onClick={onRecalibrate}
-            className="rounded-full border border-white/15 px-5 py-2.5 text-sm"
-          >
-            Recalibrate
-          </button>
-          <button
-            type="button"
-            onClick={onStart}
-            className="rounded-full bg-[#d4a017] px-5 py-2.5 text-sm font-semibold text-[#0b1220]"
-          >
-            Start typing
-          </button>
+        <div className="flex h-20 gap-4">
+          <div className="flex w-48">{renderKey(RECALIBRATE_KEY)}</div>
+          <div className="flex w-48">{renderKey(START_TYPING_KEY)}</div>
         </div>
       ) : null}
     </header>
@@ -1153,8 +1294,8 @@ function StartScreen({
           Sit an arm&apos;s length away with your face in the camera preview.
         </li>
         <li className="rounded-2xl border border-white/10 bg-white/5 p-4">
-          Head: face each highlighted key and click it once. Eyes: look at
-          each key and click it {CLICKS_PER_POINT} times.
+          Head: face each highlighted key and hold still; it records by
+          itself. Eyes: look at each key and click it {CLICKS_PER_POINT} times.
         </li>
         <li className="rounded-2xl border border-white/10 bg-white/5 p-4">
           Point at a key for 1 second to press it. Press each letter&apos;s key
@@ -1196,23 +1337,26 @@ function StartScreen({
 
 function WinkCalibration({
   step,
-  capturing,
   progress,
   error,
   faceOk,
-  onStart,
-  onSkip,
 }: {
   step: number;
-  capturing: boolean;
   progress: number;
   error: string | null;
   faceOk: boolean;
-  onStart: () => void;
-  onSkip: () => void;
 }) {
   const current = WINK_STEPS[step];
-  const settling = capturing && progress < WINK_SETTLE_MS / (WINK_SETTLE_MS + WINK_CAPTURE_MS);
+  const elapsed = progress * WINK_TOTAL_MS;
+  const status = error
+    ? "Retrying in a moment…"
+    : elapsed < WINK_READY_MS
+      ? `Get ready… ${Math.ceil((WINK_READY_MS - elapsed) / 1000)}`
+      : elapsed < WINK_READY_MS + WINK_SETTLE_MS
+        ? current.id === "open"
+          ? "Eyes open now"
+          : `Close your ${current.id.toUpperCase()} eye now`
+        : "Hold it…";
   return (
     <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center gap-6 px-6 py-10">
       <div>
@@ -1254,36 +1398,13 @@ function WinkCalibration({
         />
       </div>
 
+      <p className="text-2xl font-semibold text-[#d4a017]">{status}</p>
+
       {error ? (
         <p className="rounded-xl border border-red-400/30 bg-red-400/10 px-4 py-3 text-red-200">
           {error}
         </p>
       ) : null}
-
-      <div className="flex flex-wrap items-center gap-4">
-        <button
-          type="button"
-          onClick={onStart}
-          disabled={capturing}
-          className="rounded-full bg-[#d4a017] px-6 py-3 text-sm font-semibold text-[#0b1220] disabled:opacity-60"
-        >
-          {capturing
-            ? settling
-              ? "Get into position…"
-              : "Hold it…"
-            : error
-              ? "Try again"
-              : "Start"}
-        </button>
-        <button
-          type="button"
-          onClick={onSkip}
-          disabled={capturing}
-          className="rounded-full border border-white/15 px-6 py-3 text-sm disabled:opacity-60"
-        >
-          Skip (use default 30%)
-        </button>
-      </div>
     </main>
   );
 }
