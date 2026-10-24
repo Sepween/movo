@@ -70,6 +70,16 @@ export const CALIBRATION_KEYS = [
   "5",
 ] as const;
 
+// Head pointing is close to linear, so the centre plus the four corners is
+// enough. The centre comes first: sensitivity scales around it.
+export const HEAD_CALIBRATION_KEYS = [
+  "5",
+  "1",
+  "3",
+  "backspace",
+  "enter",
+] as const;
+
 export function keyCenter(id: string, nodes: Map<string, HTMLElement>) {
   const node = nodes.get(id);
   if (!node) return null;

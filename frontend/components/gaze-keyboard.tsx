@@ -5,6 +5,7 @@ import {
   applyKey,
   CALIBRATION_KEYS,
   findKey,
+  HEAD_CALIBRATION_KEYS,
   KEY_ROWS,
   keyCenter,
   nextCycle,
@@ -12,6 +13,7 @@ import {
   type Cycle,
   type KeyDef,
 } from "@/lib/keyboard";
+import { createFaceLandmarker, HeadTracker } from "@/lib/head";
 import {
   faceInBox,
   precisionScore,
@@ -30,6 +32,11 @@ const GRACE_MS = 280;
 const CLICKS_PER_POINT = 5;
 const MEASURE_MS = 5000;
 const MEASURE_KEY = CALIBRATION_KEYS[CALIBRATION_KEYS.length - 1];
+// Head calibration: one click per key, then hold still while poses record.
+const CAPTURE_MS = 1000;
+const SETTLE_MS = 250;
+const MIN_CAPTURE_SAMPLES = 8;
+const SENSITIVITIES = [1, 1.5, 2] as const;
 
 type Phase =
   | "start"
@@ -39,7 +46,11 @@ type Phase =
   | "result"
   | "typing"
   | "error";
-type InputMode = "eye" | "mouse";
+type InputMode = "head" | "eye" | "mouse";
+
+function calibrationKeys(mode: InputMode): readonly string[] {
+  return mode === "head" ? HEAD_CALIBRATION_KEYS : CALIBRATION_KEYS;
+}
 
 type DwellState = {
   keyId: string | null;
@@ -65,7 +76,7 @@ function emptyDwell(): DwellState {
 
 export function GazeKeyboard() {
   const [phase, setPhase] = useState<Phase>("start");
-  const [mode, setMode] = useState<InputMode>("eye");
+  const [mode, setMode] = useState<InputMode>("head");
   const [error, setError] = useState<string | null>(null);
   const [text, setText] = useState("");
   const [pending, setPending] = useState<Cycle | null>(null);
@@ -80,17 +91,27 @@ export function GazeKeyboard() {
   const [clicks, setClicks] = useState(0);
   const [measureProgress, setMeasureProgress] = useState(0);
   const [accuracy, setAccuracy] = useState<number | null>(null);
+  const [capturing, setCapturing] = useState(false);
+  const [captureProgress, setCaptureProgress] = useState(0);
+  const [sensitivity, setSensitivity] = useState<number>(1);
 
   const keyNodes = useRef(new Map<string, HTMLElement>());
   const dwell = useRef<DwellState>(emptyDwell());
   const phaseRef = useRef<Phase>("start");
-  const modeRef = useRef<InputMode>("eye");
+  const modeRef = useRef<InputMode>("head");
   const activePointRef = useRef(0);
   const clicksRef = useRef(0);
   const measured = useRef<Point[]>([]);
   const lastUi = useRef(0);
   const cycleRef = useRef<Cycle | null>(null);
   const onGazeRef = useRef<(point: Point | null) => void>(() => {});
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const trackerRef = useRef<HeadTracker | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const capturingRef = useRef(false);
+  const captureStarted = useRef(0);
+  const captureCount = useRef(0);
+  const faceOkRef = useRef(false);
 
   phaseRef.current = phase;
   modeRef.current = mode;
@@ -201,8 +222,12 @@ export function GazeKeyboard() {
     };
   }, [applyGazePoint]);
 
-  const beginCalibration = useCallback(async () => {
-    await resetCalibration();
+  const beginCalibration = useCallback(async (forMode: InputMode) => {
+    if (forMode === "head") trackerRef.current?.reset();
+    else await resetCalibration();
+    capturingRef.current = false;
+    setCapturing(false);
+    setCaptureProgress(0);
     dwell.current = emptyDwell();
     clicksRef.current = 0;
     setClicks(0);
@@ -221,8 +246,52 @@ export function GazeKeyboard() {
     setPhase("measure");
   }, []);
 
+  const stopHead = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    trackerRef.current?.close();
+    trackerRef.current = null;
+  }, []);
+
+  const startHeadTracking = useCallback(async () => {
+    stopWebGazer();
+    stopHead();
+    setMode("head");
+    setError(null);
+    setPhase("loading");
+    dwell.current = emptyDwell();
+    faceOkRef.current = false;
+    setFaceOk(false);
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: 640, height: 480 },
+        audio: false,
+      });
+      streamRef.current = stream;
+      const video = videoRef.current;
+      if (!video) throw new Error("Camera preview failed to start.");
+      video.srcObject = stream;
+      await video.play();
+
+      const tracker = new HeadTracker(await createFaceLandmarker());
+      tracker.sensitivity = sensitivity;
+      trackerRef.current = tracker;
+      await beginCalibration("head");
+    } catch (err) {
+      stopHead();
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Camera permission is required for head tracking.",
+      );
+      setPhase("error");
+    }
+  }, [beginCalibration, sensitivity, stopHead]);
+
   const startEyeTracking = useCallback(async () => {
     stopWebGazer();
+    stopHead();
     setMode("eye");
     setError(null);
     setPhase("loading");
@@ -231,7 +300,7 @@ export function GazeKeyboard() {
 
     try {
       await startWebGazer((point) => onGazeRef.current(point));
-      await beginCalibration();
+      await beginCalibration("eye");
     } catch (err) {
       stopWebGazer();
       setError(
@@ -241,16 +310,17 @@ export function GazeKeyboard() {
       );
       setPhase("error");
     }
-  }, [beginCalibration]);
+  }, [beginCalibration, stopHead]);
 
   const startMousePractice = useCallback(() => {
     stopWebGazer();
+    stopHead();
     setMode("mouse");
     setError(null);
     setFaceOk(true);
     dwell.current = emptyDwell();
     setPhase("typing");
-  }, []);
+  }, [stopHead]);
 
   const startTyping = useCallback(() => {
     dwell.current = emptyDwell();
@@ -261,6 +331,16 @@ export function GazeKeyboard() {
   const onKeyClick = useCallback(
     (key: KeyDef) => {
       const current = phaseRef.current;
+      if (current === "calibrate" && modeRef.current === "head") {
+        if (key.id !== HEAD_CALIBRATION_KEYS[activePointRef.current]) return;
+        if (capturingRef.current) return;
+        captureStarted.current = 0;
+        captureCount.current = 0;
+        capturingRef.current = true;
+        setCapturing(true);
+        setCaptureProgress(0);
+        return;
+      }
       if (current === "calibrate") {
         if (key.id !== CALIBRATION_KEYS[activePointRef.current]) return;
         const target = keyCenter(key.id, keyNodes.current);
@@ -304,6 +384,71 @@ export function GazeKeyboard() {
     return () => window.clearInterval(timer);
   }, [phase]);
 
+  // Head mode: run the face landmarker every frame, record poses while a
+  // calibration key is capturing, otherwise turn poses into cursor points.
+  useEffect(() => {
+    if (mode !== "head") return;
+    if (phase === "start" || phase === "loading" || phase === "error") return;
+
+    let raf = 0;
+    const loop = () => {
+      raf = requestAnimationFrame(loop);
+      const video = videoRef.current;
+      const tracker = trackerRef.current;
+      if (!video || !tracker) return;
+
+      const detected = tracker.detect(video);
+      if (detected.faceOk !== faceOkRef.current) {
+        faceOkRef.current = detected.faceOk;
+        setFaceOk(detected.faceOk);
+      }
+      if (!detected.pose || !detected.fresh) return;
+
+      if (phaseRef.current !== "calibrate") {
+        const point = tracker.predict(detected.pose);
+        if (point) onGazeRef.current(point);
+        return;
+      }
+      if (!capturingRef.current) return;
+
+      const target = keyCenter(
+        HEAD_CALIBRATION_KEYS[activePointRef.current],
+        keyNodes.current,
+      );
+      if (!target) return;
+      const now = performance.now();
+      if (captureStarted.current === 0) captureStarted.current = now;
+      const elapsed = now - captureStarted.current;
+      if (elapsed >= SETTLE_MS) {
+        tracker.addSample(detected.pose, target);
+        captureCount.current += 1;
+      }
+      setCaptureProgress(Math.min(1, elapsed / CAPTURE_MS));
+      if (elapsed < CAPTURE_MS || captureCount.current < MIN_CAPTURE_SAMPLES) {
+        return;
+      }
+
+      capturingRef.current = false;
+      setCapturing(false);
+      setCaptureProgress(0);
+      const nextIndex = activePointRef.current + 1;
+      if (nextIndex < HEAD_CALIBRATION_KEYS.length) {
+        setActivePoint(nextIndex);
+        return;
+      }
+      const anchor = keyCenter(HEAD_CALIBRATION_KEYS[0], keyNodes.current);
+      if (!anchor || !tracker.fit(anchor)) {
+        setError("Calibration failed. Keep your face in view and try again.");
+        setPhase("error");
+        return;
+      }
+      startMeasure();
+    };
+
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [mode, phase, startMeasure]);
+
   useEffect(() => {
     if (mode !== "eye" || phase === "start" || phase === "error") return;
     const timer = window.setInterval(() => setFaceOk(faceInBox()), 250);
@@ -319,14 +464,22 @@ export function GazeKeyboard() {
   }, [applyGazePoint, mode, phase]);
 
   useEffect(() => {
-    return () => stopWebGazer();
-  }, []);
+    return () => {
+      stopWebGazer();
+      stopHead();
+    };
+  }, [stopHead]);
 
   useEffect(() => {
     if (!pending) return;
     const timer = window.setTimeout(() => setPending(null), MULTITAP_MS + 100);
     return () => window.clearTimeout(timer);
   }, [pending]);
+
+  const chooseSensitivity = useCallback((value: number) => {
+    setSensitivity(value);
+    if (trackerRef.current) trackerRef.current.sensitivity = value;
+  }, []);
 
   const clearText = useCallback(() => {
     cycleRef.current = null;
@@ -338,16 +491,29 @@ export function GazeKeyboard() {
   const showKeyboard = calibrating || phase === "result" || phase === "typing";
   const activeCalibKey =
     phase === "calibrate"
-      ? CALIBRATION_KEYS[activePoint]
+      ? calibrationKeys(mode)[activePoint]
       : phase === "measure"
         ? MEASURE_KEY
         : null;
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[#0b1220] text-[#f4efe4]">
+      <video
+        ref={videoRef}
+        className={`pointer-events-none fixed top-3 left-3 z-40 h-[120px] w-[160px] rounded-2xl object-cover shadow-lg ring-2 -scale-x-100 ${
+          mode === "head" && phase !== "start" && phase !== "error"
+            ? "opacity-100"
+            : "opacity-0"
+        } ${faceOk ? "ring-emerald-400" : "ring-red-400"}`}
+        autoPlay
+        muted
+        playsInline
+      />
+
       {phase === "start" || phase === "error" ? (
         <StartScreen
           error={error}
+          onStartHead={startHeadTracking}
           onStartCamera={startEyeTracking}
           onPractice={startMousePractice}
         />
@@ -356,7 +522,7 @@ export function GazeKeyboard() {
       {phase === "loading" ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
           <p className="text-sm tracking-[0.25em] text-[#d4a017] uppercase">
-            Starting WebGazer
+            {mode === "head" ? "Starting camera" : "Starting WebGazer"}
           </p>
           <h1 className="max-w-md text-4xl font-semibold tracking-tight">
             Keep your face in the frame.
@@ -368,7 +534,7 @@ export function GazeKeyboard() {
         <div className="flex min-h-0 flex-1 flex-col px-4 pb-5 pt-3 sm:px-8">
           {phase === "typing" ? (
             <header
-              className={`mb-3 flex shrink-0 items-start justify-end gap-3 ${mode === "eye" ? "pl-48" : ""}`}
+              className={`mb-3 flex shrink-0 items-start justify-end gap-3 ${mode !== "mouse" ? "pl-48" : ""}`}
             >
               <button
                 type="button"
@@ -377,10 +543,29 @@ export function GazeKeyboard() {
               >
                 Clear
               </button>
-              {mode === "eye" ? (
+              {mode === "head" ? (
+                <div className="mr-auto flex items-center gap-1 rounded-full border border-white/15 p-1 text-sm">
+                  <span className="px-2 text-[#c8c0b0]">Sensitivity</span>
+                  {SENSITIVITIES.map((value) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => chooseSensitivity(value)}
+                      className={`rounded-full px-3 py-1 ${
+                        sensitivity === value
+                          ? "bg-[#d4a017] text-[#0b1220]"
+                          : "text-[#f4efe4]"
+                      }`}
+                    >
+                      {value}×
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {mode !== "mouse" ? (
                 <button
                   type="button"
-                  onClick={beginCalibration}
+                  onClick={() => beginCalibration(mode)}
                   className="rounded-full border border-white/15 px-4 py-2 text-sm"
                 >
                   Recalibrate
@@ -389,20 +574,27 @@ export function GazeKeyboard() {
             </header>
           ) : (
             <CalibrationHeader
+              mode={mode}
               phase={phase}
+              capturing={capturing}
               activePoint={activePoint}
               clicks={clicks}
               faceOk={faceOk}
               accuracy={accuracy}
               onStart={startTyping}
-              onRecalibrate={beginCalibration}
+              onRecalibrate={() => beginCalibration(mode)}
             />
           )}
 
           {phase === "typing" ? (
             <section className="mx-auto mb-4 w-full max-w-6xl shrink-0 rounded-3xl bg-[#f4efe4] px-5 py-4 text-[#0b1220]">
               <p className="text-xs tracking-[0.22em] text-[#8a7f68] uppercase">
-                {mode === "eye" ? "Gaze output" : "Mouse practice"} · hold a key
+                {mode === "head"
+                  ? "Head pointer"
+                  : mode === "eye"
+                    ? "Gaze output"
+                    : "Mouse practice"}{" "}
+                · hold a key
                 for 1s, keep holding to cycle letters
               </p>
               <p className="mt-2 min-h-16 font-mono text-2xl leading-snug break-words whitespace-pre-wrap sm:text-3xl">
@@ -427,7 +619,9 @@ export function GazeKeyboard() {
             hoveredKey={calibrating ? activeCalibKey : phase === "typing" ? hoveredKey : null}
             progress={
               phase === "calibrate"
-                ? clicks / CLICKS_PER_POINT
+                ? mode === "head"
+                  ? captureProgress
+                  : clicks / CLICKS_PER_POINT
                 : phase === "measure"
                   ? measureProgress
                   : progress
@@ -455,7 +649,9 @@ export function GazeKeyboard() {
 }
 
 function CalibrationHeader({
+  mode,
   phase,
+  capturing,
   activePoint,
   clicks,
   faceOk,
@@ -463,7 +659,9 @@ function CalibrationHeader({
   onStart,
   onRecalibrate,
 }: {
+  mode: InputMode;
   phase: Phase;
+  capturing: boolean;
   activePoint: number;
   clicks: number;
   faceOk: boolean;
@@ -471,15 +669,26 @@ function CalibrationHeader({
   onStart: () => void;
   onRecalibrate: () => void;
 }) {
-  let eyebrow = `Calibration ${activePoint + 1} / ${CALIBRATION_KEYS.length}`;
-  let title = `Look at the highlighted key and click it ${CLICKS_PER_POINT} times.`;
-  let detail = faceOk
-    ? `Keep your eyes on the key while you click. ${clicks} / ${CLICKS_PER_POINT} clicks.`
-    : "Move until the box on the camera preview turns green.";
+  const head = mode === "head";
+  let eyebrow = `Calibration ${activePoint + 1} / ${calibrationKeys(mode).length}`;
+  let title = head
+    ? capturing
+      ? "Hold still, facing that key."
+      : "Turn your face toward the highlighted key, then click it."
+    : `Look at the highlighted key and click it ${CLICKS_PER_POINT} times.`;
+  let detail = head
+    ? faceOk
+      ? "Aim with your nose, like a laser pointer. Small, comfortable head turns are enough; you can raise sensitivity later."
+      : "Move until the camera ring turns green."
+    : faceOk
+      ? `Keep your eyes on the key while you click. ${clicks} / ${CLICKS_PER_POINT} clicks.`
+      : "Move until the box on the camera preview turns green.";
 
   if (phase === "measure") {
     eyebrow = "Measuring accuracy";
-    title = "Stare at the highlighted key for 5 seconds.";
+    title = head
+      ? "Keep facing the highlighted key for 5 seconds."
+      : "Stare at the highlighted key for 5 seconds.";
     detail = "Don't move the mouse. We're checking how close the predictions land.";
   } else if (phase === "result") {
     eyebrow = "Calibration done";
@@ -523,10 +732,12 @@ function CalibrationHeader({
 
 function StartScreen({
   error,
+  onStartHead,
   onStartCamera,
   onPractice,
 }: {
   error: string | null;
+  onStartHead: () => void;
   onStartCamera: () => void;
   onPractice: () => void;
 }) {
@@ -537,25 +748,25 @@ function StartScreen({
           Webcam gaze keyboard
         </p>
         <h1 className="text-4xl font-semibold tracking-tight text-pretty sm:text-5xl">
-          Look at a key for one second to type it.
+          Point at a key for one second to type it.
         </h1>
         <p className="max-w-xl text-base leading-7 text-[#c8c0b0] sm:text-lg sm:leading-8">
-          Eye tracking runs on WebGazer. Calibration happens on the keyboard
-          itself, so the model is trained on the real key positions.
+          Head tracking moves the cursor with where your face points. Eye
+          tracking (WebGazer) follows your gaze instead. Both calibrate on the
+          keyboard itself.
         </p>
       </div>
       <ol className="grid gap-3 text-sm text-[#c8c0b0] sm:grid-cols-3">
         <li className="rounded-2xl border border-white/10 bg-white/5 p-4">
-          Sit an arm&apos;s length away. The box on the camera preview must
-          stay green.
+          Sit an arm&apos;s length away with your face in the camera preview.
         </li>
         <li className="rounded-2xl border border-white/10 bg-white/5 p-4">
-          Click each highlighted key {CLICKS_PER_POINT} times while looking at
-          it, then stare at the centre key for 5 seconds.
+          Head: face each highlighted key and click it once. Eyes: look at
+          each key and click it {CLICKS_PER_POINT} times.
         </li>
         <li className="rounded-2xl border border-white/10 bg-white/5 p-4">
-          Look at a key for 1 second to type its first letter. Keep looking to
-          cycle to the next one, then look away to keep it.
+          Point at a key for 1 second to type its first letter. Keep pointing
+          to cycle to the next one, then move away to keep it.
         </li>
       </ol>
       {error ? (
@@ -566,10 +777,17 @@ function StartScreen({
       <div className="flex flex-wrap items-center gap-4">
         <button
           type="button"
-          onClick={onStartCamera}
+          onClick={onStartHead}
           className="rounded-full bg-[#d4a017] px-6 py-3 text-sm font-semibold text-[#0b1220]"
         >
-          Enable camera
+          Head tracking
+        </button>
+        <button
+          type="button"
+          onClick={onStartCamera}
+          className="rounded-full border border-white/15 px-6 py-3 text-sm text-[#f4efe4]"
+        >
+          Eye tracking (WebGazer)
         </button>
         <button
           type="button"
