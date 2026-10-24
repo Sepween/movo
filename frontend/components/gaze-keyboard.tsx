@@ -10,11 +10,15 @@ import {
   keyCenter,
   nextCycle,
   pickGazeKey,
-  SNAP_ZONE,
   type Cycle,
   type KeyDef,
 } from "@/lib/keyboard";
-import { createFaceLandmarker, HeadTracker } from "@/lib/head";
+import {
+  createFaceLandmarker,
+  HeadTracker,
+  type EyeOpenness,
+} from "@/lib/head";
+import { speakText } from "@/lib/speech";
 import {
   isWordDigit,
   loadDictionary,
@@ -34,6 +38,8 @@ import {
 
 const DWELL_MS = 900;
 const CYCLE_MS = 800;
+// Keeping the pointer on a key presses it again at this interval.
+const REPEAT_MS = 900;
 const MULTITAP_MS = 900;
 const SWITCH_MS = 160;
 const GRACE_MS = 280;
@@ -44,7 +50,49 @@ const MEASURE_KEY = CALIBRATION_KEYS[CALIBRATION_KEYS.length - 1];
 const CAPTURE_MS = 1000;
 const SETTLE_MS = 250;
 const MIN_CAPTURE_SAMPLES = 8;
-const SENSITIVITIES = [1, 1.5, 2] as const;
+// Wink calibration: after clicking Start, wait for the user to settle into
+// the pose, then record for WINK_CAPTURE_MS.
+const WINK_SETTLE_MS = 700;
+const WINK_CAPTURE_MS = 1200;
+const WINK_STEPS = [
+  {
+    id: "open",
+    title: "Both eyes open",
+    instruction: "Look at the screen with both eyes open and relaxed.",
+  },
+  {
+    id: "left",
+    title: "Wink your left eye",
+    instruction: "Close only your LEFT eye and hold it until the bar fills.",
+  },
+  {
+    id: "right",
+    title: "Wink your right eye",
+    instruction: "Close only your RIGHT eye and hold it until the bar fills.",
+  },
+] as const;
+// Action keys beside the output box. They snap and dwell like the keypad but
+// never repeat when held.
+const CLEAR_KEY: KeyDef = { id: "clear", label: "Clear" };
+const SPEAK_KEY: KeyDef = { id: "speak", label: "Read aloud" };
+const ACTION_KEYS = [CLEAR_KEY, SPEAK_KEY];
+// Full-width snap strips along the top and bottom of the output box. Holding
+// one for SCROLL_DELAY_MS scrolls the box at SCROLL_SPEED px/s.
+const SCROLL_UP_KEY: KeyDef = { id: "scroll-up", label: "Scroll up" };
+const SCROLL_DOWN_KEY: KeyDef = { id: "scroll-down", label: "Scroll down" };
+const SCROLL_DIRECTION: Record<string, number> = {
+  [SCROLL_UP_KEY.id]: -1,
+  [SCROLL_DOWN_KEY.id]: 1,
+};
+const SCROLL_DELAY_MS = 400;
+const SCROLL_SPEED = 60;
+// What still responds to the pointer while paused.
+const PAUSE_KEY_IDS = new Set([
+  CLEAR_KEY.id,
+  SPEAK_KEY.id,
+  SCROLL_UP_KEY.id,
+  SCROLL_DOWN_KEY.id,
+]);
 const SUGGESTION_COUNT = 4;
 const SUGGESTION_PREFIX = "suggest-";
 
@@ -62,6 +110,7 @@ type Phase =
   | "calibrate"
   | "measure"
   | "result"
+  | "winkCalibrate"
   | "typing"
   | "error";
 type InputMode = "head" | "eye" | "mouse";
@@ -111,10 +160,14 @@ export function GazeKeyboard() {
   const [accuracy, setAccuracy] = useState<number | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [captureProgress, setCaptureProgress] = useState(0);
-  const [sensitivity, setSensitivity] = useState<number>(1);
   const [entry, setEntry] = useState<Entry>("predictive");
   const [digits, setDigits] = useState("");
   const [dict, setDict] = useState<Dictionary | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [winkStep, setWinkStep] = useState(0);
+  const [winkCapturing, setWinkCapturing] = useState(false);
+  const [winkProgress, setWinkProgress] = useState(0);
+  const [winkError, setWinkError] = useState<string | null>(null);
 
   const keyNodes = useRef(new Map<string, HTMLElement>());
   const dwell = useRef<DwellState>(emptyDwell());
@@ -137,6 +190,16 @@ export function GazeKeyboard() {
   const digitsRef = useRef("");
   const dictRef = useRef<Dictionary | null>(null);
   const suggestionsRef = useRef<KeyDef[]>([]);
+  const pausedRef = useRef(false);
+  const outputRef = useRef<HTMLParagraphElement>(null);
+  const textRef = useRef("");
+  const winkStepRef = useRef(0);
+  const winkCapturingRef = useRef(false);
+  const winkCaptureStart = useRef(0);
+  const winkSamples = useRef<EyeOpenness[]>([]);
+  // Where wink calibration goes next: the accuracy check during the first
+  // calibration, or straight back to typing when re-run from the header.
+  const winkReturnRef = useRef<"measure" | "typing">("measure");
 
   phaseRef.current = phase;
   modeRef.current = mode;
@@ -168,6 +231,17 @@ export function GazeKeyboard() {
       setFiredKey((current) => (current === key.id ? null : current));
     }, 160);
 
+    if (key.id === CLEAR_KEY.id) {
+      cycleRef.current = null;
+      setPending(null);
+      setSequence("");
+      setText("");
+      return;
+    }
+    if (key.id === SPEAK_KEY.id) {
+      speakText(textRef.current + previewWord(dictRef.current, digitsRef.current));
+      return;
+    }
     if (key.id.startsWith(SUGGESTION_PREFIX)) {
       cycleRef.current = null;
       setPending(null);
@@ -208,6 +282,10 @@ export function GazeKeyboard() {
   }, [commitComposing, setSequence]);
 
   const resolveKey = useCallback((id: string) => {
+    const action = [...ACTION_KEYS, SCROLL_UP_KEY, SCROLL_DOWN_KEY].find(
+      (key) => key.id === id,
+    );
+    if (action) return action;
     if (!id.startsWith(SUGGESTION_PREFIX)) return findKey(id);
     return suggestionsRef.current.find((key) => key.id === id) ?? null;
   }, []);
@@ -222,28 +300,52 @@ export function GazeKeyboard() {
     [],
   );
 
+  // Suggestions and action keys act once, so holding them must not repeat.
+  const holdInterval = useCallback(
+    (key: KeyDef | null) => {
+      if (!key || key.id.startsWith(SUGGESTION_PREFIX)) return null;
+      if (ACTION_KEYS.includes(key)) return null;
+      return cyclesOnHold(key) ? CYCLE_MS : REPEAT_MS;
+    },
+    [cyclesOnHold],
+  );
+
+  // `paused` limits the pointer to the keys in PAUSE_KEY_IDS.
   const applyGazePoint = useCallback(
-    (point: Point) => {
+    (point: Point, paused = false) => {
       const now = performance.now();
       const state = dwell.current;
-      const hit = pickGazeKey(point.x, point.y, state.keyId, keyNodes.current);
+      let hit = pickGazeKey(point.x, point.y, state.keyId, keyNodes.current);
+      if (paused && hit && !PAUSE_KEY_IDS.has(hit)) hit = null;
+      const scrollDir = hit ? SCROLL_DIRECTION[hit] : undefined;
 
-      if (hit && hit === state.keyId) {
+      if (hit && hit === state.keyId && scrollDir) {
+        state.leftAt = null;
+        state.pendingId = null;
+        const output = outputRef.current;
+        const last = state.lastFire > state.since ? state.lastFire : now;
+        if (output && now - state.since >= SCROLL_DELAY_MS) {
+          output.scrollTop += (scrollDir * SCROLL_SPEED * (now - last)) / 1000;
+        }
+        state.lastFire = now;
+      } else if (hit && hit === state.keyId) {
         state.leftAt = null;
         state.pendingId = null;
         const key = resolveKey(hit);
+        const interval = holdInterval(key);
         if (key && !state.fired && now - state.since >= DWELL_MS) {
           state.fired = true;
           state.lastFire = now;
           typeKey(key, false);
         } else if (
           key &&
-          cyclesOnHold(key) &&
+          interval !== null &&
           state.fired &&
-          now - state.lastFire >= CYCLE_MS
+          now - state.lastFire >= interval
         ) {
           state.lastFire = now;
-          typeKey(key, true);
+          // Multi-tap keys cycle their letters; everything else repeats.
+          typeKey(key, cyclesOnHold(key));
         }
       } else if (hit && hit !== state.keyId) {
         if (state.pendingId !== hit) {
@@ -269,15 +371,41 @@ export function GazeKeyboard() {
         setGaze(snapped ? { ...snapped, snapped: true } : { ...point, snapped: false });
         setHoveredKey(shown);
         let fill = 0;
-        if (shown && !dwell.current.fired) {
+        if (shown && SCROLL_DIRECTION[shown]) {
+          fill = (now - dwell.current.since) / SCROLL_DELAY_MS;
+        } else if (shown && !dwell.current.fired) {
           fill = (now - dwell.current.since) / DWELL_MS;
-        } else if (shown && cyclesOnHold(resolveKey(shown))) {
-          fill = (now - dwell.current.lastFire) / CYCLE_MS;
+        } else if (shown) {
+          const interval = holdInterval(resolveKey(shown));
+          if (interval !== null) {
+            fill = (now - dwell.current.lastFire) / interval;
+          }
         }
         setProgress(Math.min(1, fill));
       }
     },
-    [cyclesOnHold, resolveKey, typeKey],
+    [cyclesOnHold, holdInterval, resolveKey, typeKey],
+  );
+
+  // While paused the cursor still moves, but only Clear, Read aloud and the
+  // scroll strips respond.
+  const setPausedState = useCallback((next: boolean) => {
+    pausedRef.current = next;
+    setPaused(next);
+    dwell.current = emptyDwell();
+    setHoveredKey(null);
+    setProgress(0);
+  }, []);
+
+  const chooseEntry = useCallback(
+    (next: Entry) => {
+      commitComposing();
+      cycleRef.current = null;
+      setPending(null);
+      entryRef.current = next;
+      setEntry(next);
+    },
+    [commitComposing],
   );
 
   // WebGazer calls this for every frame; route it by phase.
@@ -286,7 +414,7 @@ export function GazeKeyboard() {
       if (!point) return;
       const current = phaseRef.current;
       if (current === "typing") {
-        applyGazePoint(point);
+        applyGazePoint(point, pausedRef.current);
         return;
       }
       if (current === "measure") measured.current.push(point);
@@ -314,14 +442,37 @@ export function GazeKeyboard() {
     setHoveredKey(null);
     setProgress(0);
     setGaze(null);
+    setPausedState(false);
     setPhase("calibrate");
-  }, []);
+  }, [setPausedState]);
 
   const startMeasure = useCallback(() => {
     measured.current = [];
     setMeasureProgress(0);
     setGaze(null);
     setPhase("measure");
+  }, []);
+
+  const startWinkCalibration = useCallback((returnTo: "measure" | "typing") => {
+    winkReturnRef.current = returnTo;
+    winkStepRef.current = 0;
+    winkCapturingRef.current = false;
+    setWinkStep(0);
+    setWinkCapturing(false);
+    setWinkProgress(0);
+    setWinkError(null);
+    setGaze(null);
+    setPhase("winkCalibrate");
+  }, []);
+
+  const startWinkCapture = useCallback(() => {
+    if (winkCapturingRef.current) return;
+    winkSamples.current = [];
+    winkCaptureStart.current = performance.now();
+    winkCapturingRef.current = true;
+    setWinkCapturing(true);
+    setWinkProgress(0);
+    setWinkError(null);
   }, []);
 
   const stopHead = useCallback(() => {
@@ -352,9 +503,7 @@ export function GazeKeyboard() {
       video.srcObject = stream;
       await video.play();
 
-      const tracker = new HeadTracker(await createFaceLandmarker());
-      tracker.sensitivity = sensitivity;
-      trackerRef.current = tracker;
+      trackerRef.current = new HeadTracker(await createFaceLandmarker());
       await beginCalibration("head");
     } catch (err) {
       stopHead();
@@ -365,7 +514,7 @@ export function GazeKeyboard() {
       );
       setPhase("error");
     }
-  }, [beginCalibration, sensitivity, stopHead]);
+  }, [beginCalibration, stopHead]);
 
   const startEyeTracking = useCallback(async () => {
     stopWebGazer();
@@ -401,10 +550,17 @@ export function GazeKeyboard() {
   }, [stopHead]);
 
   const startTyping = useCallback(() => {
-    dwell.current = emptyDwell();
+    setPausedState(false);
     setGaze(null);
     setPhase("typing");
-  }, []);
+  }, [setPausedState]);
+
+  const finishWinkCalibration = useCallback(() => {
+    winkCapturingRef.current = false;
+    setWinkCapturing(false);
+    if (winkReturnRef.current === "measure") startMeasure();
+    else startTyping();
+  }, [startMeasure, startTyping]);
 
   const onKeyClick = useCallback(
     (key: KeyDef) => {
@@ -480,6 +636,45 @@ export function GazeKeyboard() {
         faceOkRef.current = detected.faceOk;
         setFaceOk(detected.faceOk);
       }
+      // Left wink pauses/resumes; right wink switches typing mode.
+      if (detected.wink && phaseRef.current === "typing") {
+        if (detected.wink === "left") setPausedState(!pausedRef.current);
+        else {
+          chooseEntry(
+            entryRef.current === "predictive" ? "multitap" : "predictive",
+          );
+        }
+      }
+      if (phaseRef.current === "winkCalibrate") {
+        if (!winkCapturingRef.current || !detected.fresh) return;
+        const elapsed = performance.now() - winkCaptureStart.current;
+        if (elapsed >= WINK_SETTLE_MS && detected.eyes) {
+          winkSamples.current.push(detected.eyes);
+        }
+        setWinkProgress(Math.min(1, elapsed / (WINK_SETTLE_MS + WINK_CAPTURE_MS)));
+        if (elapsed < WINK_SETTLE_MS + WINK_CAPTURE_MS) return;
+
+        winkCapturingRef.current = false;
+        setWinkCapturing(false);
+        const step = WINK_STEPS[winkStepRef.current];
+        const result =
+          step.id === "open"
+            ? tracker.calibrateWinkOpen(winkSamples.current)
+            : tracker.calibrateWink(step.id, winkSamples.current);
+        if (!result.ok) {
+          setWinkError(result.reason);
+          return;
+        }
+        const next = winkStepRef.current + 1;
+        if (next >= WINK_STEPS.length) {
+          finishWinkCalibration();
+          return;
+        }
+        winkStepRef.current = next;
+        setWinkStep(next);
+        setWinkProgress(0);
+        return;
+      }
       if (!detected.pose || !detected.fresh) return;
 
       if (phaseRef.current !== "calibrate") {
@@ -520,12 +715,19 @@ export function GazeKeyboard() {
         setPhase("error");
         return;
       }
-      startMeasure();
+      startWinkCalibration("measure");
     };
 
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [mode, phase, startMeasure]);
+  }, [
+    chooseEntry,
+    finishWinkCalibration,
+    mode,
+    phase,
+    setPausedState,
+    startWinkCalibration,
+  ]);
 
   useEffect(() => {
     if (mode !== "eye" || phase === "start" || phase === "error") return;
@@ -536,10 +738,10 @@ export function GazeKeyboard() {
   useEffect(() => {
     if (phase !== "typing" || mode !== "mouse") return;
     const onMove = (event: MouseEvent) =>
-      applyGazePoint({ x: event.clientX, y: event.clientY });
+      onGazeRef.current({ x: event.clientX, y: event.clientY });
     window.addEventListener("mousemove", onMove);
     return () => window.removeEventListener("mousemove", onMove);
-  }, [applyGazePoint, mode, phase]);
+  }, [mode, phase]);
 
   useEffect(() => {
     return () => {
@@ -584,28 +786,52 @@ export function GazeKeyboard() {
     suggestionsRef.current = suggestions;
   }, [suggestions]);
 
-  const chooseEntry = useCallback(
-    (next: Entry) => {
-      commitComposing();
-      cycleRef.current = null;
-      setPending(null);
-      entryRef.current = next;
-      setEntry(next);
-    },
-    [commitComposing],
+  // The output box is two lines tall; keep the newest text in view.
+  useEffect(() => {
+    const output = outputRef.current;
+    if (output) output.scrollTop = output.scrollHeight;
+  }, [text, composing, phase]);
+
+  useEffect(() => {
+    textRef.current = text;
+  }, [text]);
+
+  const actionKey = (key: KeyDef) => (
+    <KeyButton
+      keyDef={key}
+      compact
+      hovered={hoveredKey === key.id}
+      fired={firedKey === key.id}
+      progress={progress}
+      isActiveCalib={false}
+      dimmed={false}
+      cycling={null}
+      onClick={() => onKeyClick(key)}
+      setKeyNode={setKeyNode}
+    />
   );
 
-  const chooseSensitivity = useCallback((value: number) => {
-    setSensitivity(value);
-    if (trackerRef.current) trackerRef.current.sensitivity = value;
-  }, []);
-
-  const clearText = useCallback(() => {
-    cycleRef.current = null;
-    setPending(null);
-    setSequence("");
-    setText("");
-  }, [setSequence]);
+  // Invisible until the pointer is on it; tints while counting down and
+  // stronger while scrolling.
+  const scrollStrip = (key: KeyDef, edge: string) => {
+    const hovered = hoveredKey === key.id;
+    return (
+      <div
+        ref={(node) => setKeyNode(key.id, node)}
+        data-snap="row"
+        aria-hidden
+        className={`pointer-events-none absolute inset-x-0 h-[38%] transition-colors ${edge} ${
+          edge === "top-0" ? "rounded-t-3xl" : "rounded-b-3xl"
+        } ${
+          hovered
+            ? progress >= 1
+              ? "bg-[#d4a017]/25"
+              : "bg-[#d4a017]/10"
+            : "bg-transparent"
+        }`}
+      />
+    );
+  };
 
   const calibrating = phase === "calibrate" || phase === "measure";
   const showKeyboard = calibrating || phase === "result" || phase === "typing";
@@ -618,13 +844,12 @@ export function GazeKeyboard() {
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[#0b1220] text-[#f4efe4]">
+      {/* The landmarker reads frames from this element, so it stays mounted
+          and playing, just never shown. */}
       <video
         ref={videoRef}
-        className={`pointer-events-none fixed top-3 left-3 z-40 h-[120px] w-[160px] rounded-2xl object-cover shadow-lg ring-2 -scale-x-100 ${
-          mode === "head" && phase !== "start" && phase !== "error"
-            ? "opacity-100"
-            : "opacity-0"
-        } ${faceOk ? "ring-emerald-400" : "ring-red-400"}`}
+        aria-hidden
+        className="pointer-events-none fixed top-0 left-0 size-px opacity-0"
         autoPlay
         muted
         playsInline
@@ -653,45 +878,63 @@ export function GazeKeyboard() {
       {showKeyboard ? (
         <div className="flex min-h-0 flex-1 flex-col px-4 pb-5 pt-3 sm:px-8">
           {phase === "typing" ? (
-            <header
-              className={`mb-3 flex shrink-0 items-start justify-end gap-3 ${mode !== "mouse" ? "pl-48" : ""}`}
-            >
-              <div className="mr-auto flex flex-wrap items-center gap-3">
-                <Segmented
-                  label="Typing"
-                  options={ENTRIES}
-                  value={entry}
-                  onChange={chooseEntry}
-                />
-                {mode === "head" ? (
-                  <Segmented
-                    label="Sensitivity"
-                    options={SENSITIVITIES.map((value) => ({
-                      id: value,
-                      label: `${value}×`,
-                    }))}
-                    value={sensitivity}
-                    onChange={chooseSensitivity}
-                  />
-                ) : null}
+            <div className="mx-auto mb-4 flex w-full max-w-6xl shrink-0 items-stretch gap-4">
+              <div className="flex w-28 shrink-0 sm:w-32">
+                {actionKey(CLEAR_KEY)}
               </div>
-              <button
-                type="button"
-                onClick={clearText}
-                className="rounded-full border border-white/15 px-4 py-2 text-sm"
+              <section
+                className="relative min-w-0 flex-1 rounded-3xl bg-[#f4efe4] px-5 py-4 text-[#0b1220]"
               >
-                Clear
-              </button>
-              {mode !== "mouse" ? (
-                <button
-                  type="button"
-                  onClick={() => beginCalibration(mode)}
-                  className="rounded-full border border-white/15 px-4 py-2 text-sm"
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <p className="text-xs tracking-[0.22em] text-[#8a7f68] uppercase">
+                    {entry === "predictive"
+                      ? "One press per letter, then pick a word"
+                      : "Keep pointing to cycle letters"}
+                  </p>
+                  <div className="flex items-center gap-3">
+                    {paused ? (
+                      <span className="rounded-full bg-[#d4a017] px-3 py-1 text-xs font-semibold tracking-[0.15em] uppercase">
+                        Paused
+                      </span>
+                    ) : null}
+                    {mode === "head" ? (
+                      <span className="text-xs text-[#8a7f68]">
+                        wink right to switch
+                      </span>
+                    ) : null}
+                    <EntrySlider value={entry} onChange={chooseEntry} />
+                  </div>
+                </div>
+                <p
+                  ref={outputRef}
+                  className="mt-2 h-[2lh] overflow-y-auto font-mono text-2xl leading-snug break-words whitespace-pre-wrap sm:text-3xl"
                 >
-                  Recalibrate
-                </button>
-              ) : null}
-            </header>
+                  {pending ? (
+                    <>
+                      {text.slice(0, -1)}
+                      <span className="rounded bg-[#d4a017]/40 underline decoration-2 underline-offset-4">
+                        {text.slice(-1)}
+                      </span>
+                    </>
+                  ) : (
+                    text
+                  )}
+                  {composing ? (
+                    <span className="rounded bg-[#d4a017]/40 underline decoration-2 underline-offset-4">
+                      {composing}
+                    </span>
+                  ) : null}
+                  <span className="ml-0.5 inline-block w-[2px] animate-pulse bg-[#0b1220] align-baseline">
+                    &nbsp;
+                  </span>
+                </p>
+                {scrollStrip(SCROLL_UP_KEY, "top-0")}
+                {scrollStrip(SCROLL_DOWN_KEY, "bottom-0")}
+              </section>
+              <div className="flex w-28 shrink-0 sm:w-32">
+                {actionKey(SPEAK_KEY)}
+              </div>
+            </div>
           ) : (
             <CalibrationHeader
               mode={mode}
@@ -706,65 +949,82 @@ export function GazeKeyboard() {
             />
           )}
 
+          <div
+            className={`relative flex min-h-0 flex-1 flex-col transition-opacity ${
+              paused && phase === "typing" ? "opacity-30" : ""
+            }`}
+          >
+            <Keyboard
+              hoveredKey={calibrating ? activeCalibKey : phase === "typing" ? hoveredKey : null}
+              progress={
+                phase === "calibrate"
+                  ? mode === "head"
+                    ? captureProgress
+                    : clicks / CLICKS_PER_POINT
+                  : phase === "measure"
+                    ? measureProgress
+                    : progress
+              }
+              firedKey={phase === "typing" ? firedKey : null}
+              pending={phase === "typing" ? pending : null}
+              suggestions={
+                phase === "typing" && entry === "predictive" ? suggestions : null
+              }
+              composing={digits.length > 0}
+              calibrating={calibrating}
+              activeCalibKey={activeCalibKey}
+              onKeyClick={onKeyClick}
+              setKeyNode={setKeyNode}
+            />
+          </div>
           {phase === "typing" ? (
-            <section className="mx-auto mb-4 w-full max-w-6xl shrink-0 rounded-3xl bg-[#f4efe4] px-5 py-4 text-[#0b1220]">
-              <p className="text-xs tracking-[0.22em] text-[#8a7f68] uppercase">
-                {mode === "head"
-                  ? "Head pointer"
-                  : mode === "eye"
-                    ? "Gaze output"
-                    : "Mouse practice"}{" "}
-                ·{" "}
-                {entry === "predictive"
-                  ? "one press per letter, then pick a word or press 0"
-                  : "hold a key for 1s, keep holding to cycle letters"}
-              </p>
-              <p className="mt-2 min-h-16 font-mono text-2xl leading-snug break-words whitespace-pre-wrap sm:text-3xl">
-                {pending ? (
-                  <>
-                    {text.slice(0, -1)}
-                    <span className="rounded bg-[#d4a017]/40 underline decoration-2 underline-offset-4">
-                      {text.slice(-1)}
-                    </span>
-                  </>
-                ) : (
-                  text
-                )}
-                {composing ? (
-                  <span className="rounded bg-[#d4a017]/40 underline decoration-2 underline-offset-4">
-                    {composing}
-                  </span>
-                ) : null}
-                <span className="ml-0.5 inline-block w-[2px] animate-pulse bg-[#0b1220] align-baseline">
-                  &nbsp;
-                </span>
-              </p>
-            </section>
+            <div className="fixed right-3 bottom-0.5 z-30 flex gap-4 text-[11px] text-[#c8c0b0]/70">
+              {mode !== "head" ? (
+                <button type="button" onClick={() => setPausedState(!paused)}>
+                  {paused ? "Resume" : "Pause"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => startWinkCalibration("typing")}
+                >
+                  Calibrate winks
+                </button>
+              )}
+              {mode !== "mouse" ? (
+                <button type="button" onClick={() => beginCalibration(mode)}>
+                  Recalibrate
+                </button>
+              ) : null}
+            </div>
           ) : null}
-
-          <Keyboard
-            hoveredKey={calibrating ? activeCalibKey : phase === "typing" ? hoveredKey : null}
-            progress={
-              phase === "calibrate"
-                ? mode === "head"
-                  ? captureProgress
-                  : clicks / CLICKS_PER_POINT
-                : phase === "measure"
-                  ? measureProgress
-                  : progress
-            }
-            firedKey={phase === "typing" ? firedKey : null}
-            pending={phase === "typing" ? pending : null}
-            suggestions={
-              phase === "typing" && entry === "predictive" ? suggestions : null
-            }
-            composing={digits.length > 0}
-            calibrating={calibrating}
-            activeCalibKey={activeCalibKey}
-            onKeyClick={onKeyClick}
-            setKeyNode={setKeyNode}
-          />
+          {paused && phase === "typing" ? (
+            <div className="pointer-events-none fixed inset-x-0 bottom-[30vh] z-30 flex justify-center px-4">
+              <div className="rounded-3xl border border-[#d4a017]/60 bg-[#0b1220]/90 px-8 py-5 text-center shadow-2xl">
+                <p className="text-sm tracking-[0.25em] text-[#d4a017] uppercase">
+                  Paused
+                </p>
+                <p className="mt-1 text-xl font-semibold">
+                  {mode === "head"
+                    ? "Wink your left eye to resume."
+                    : "Press Resume to keep typing."}
+                </p>
+              </div>
+            </div>
+          ) : null}
         </div>
+      ) : null}
+
+      {phase === "winkCalibrate" ? (
+        <WinkCalibration
+          step={winkStep}
+          capturing={winkCapturing}
+          progress={winkProgress}
+          error={winkError}
+          faceOk={faceOk}
+          onStart={startWinkCapture}
+          onSkip={finishWinkCalibration}
+        />
       ) : null}
 
       {(phase === "typing" || calibrating) && gaze ? (
@@ -809,11 +1069,11 @@ function CalibrationHeader({
     : `Look at the highlighted key and click it ${CLICKS_PER_POINT} times.`;
   let detail = head
     ? faceOk
-      ? "Aim with your nose, like a laser pointer. Small, comfortable head turns are enough; you can raise sensitivity later."
-      : "Move until the camera ring turns green."
+      ? "Aim with your nose, like a laser pointer. Small, comfortable head turns are enough."
+      : "No face detected. Move into the camera's view."
     : faceOk
       ? `Keep your eyes on the key while you click. ${clicks} / ${CLICKS_PER_POINT} clicks.`
-      : "Move until the box on the camera preview turns green.";
+      : "Face not centred. Move into the middle of the camera's view.";
 
   if (phase === "measure") {
     eyebrow = "Measuring accuracy";
@@ -831,7 +1091,7 @@ function CalibrationHeader({
   }
 
   return (
-    <header className="relative z-20 mb-4 flex shrink-0 flex-wrap items-end justify-between gap-4 pl-48">
+    <header className="relative z-20 mb-4 flex shrink-0 flex-wrap items-end justify-between gap-4">
       <div>
         <p className="text-sm tracking-[0.25em] text-[#d4a017] uppercase">
           {eyebrow}
@@ -932,29 +1192,129 @@ function StartScreen({
   );
 }
 
-function Segmented<T extends string | number>({
-  label,
-  options,
+function WinkCalibration({
+  step,
+  capturing,
+  progress,
+  error,
+  faceOk,
+  onStart,
+  onSkip,
+}: {
+  step: number;
+  capturing: boolean;
+  progress: number;
+  error: string | null;
+  faceOk: boolean;
+  onStart: () => void;
+  onSkip: () => void;
+}) {
+  const current = WINK_STEPS[step];
+  const settling = capturing && progress < WINK_SETTLE_MS / (WINK_SETTLE_MS + WINK_CAPTURE_MS);
+  return (
+    <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col justify-center gap-6 px-6 py-10">
+      <div>
+        <p className="text-sm tracking-[0.25em] text-[#d4a017] uppercase">
+          Wink calibration {step + 1} / {WINK_STEPS.length}
+        </p>
+        <h1 className="mt-1 text-4xl font-semibold tracking-tight">
+          {current.title}
+        </h1>
+        <p className="mt-2 text-lg text-[#c8c0b0]">
+          {faceOk
+            ? current.instruction
+            : "No face detected. Move into the camera's view."}
+        </p>
+      </div>
+
+      <ol className="grid grid-cols-3 gap-3 text-sm">
+        {WINK_STEPS.map((item, index) => (
+          <li
+            key={item.id}
+            className={`rounded-2xl border p-3 ${
+              index < step
+                ? "border-emerald-400/50 text-emerald-300"
+                : index === step
+                  ? "border-[#d4a017] text-[#f4efe4]"
+                  : "border-white/10 text-[#c8c0b0]"
+            }`}
+          >
+            {index < step ? "✓ " : ""}
+            {item.title}
+          </li>
+        ))}
+      </ol>
+
+      <div className="h-3 overflow-hidden rounded-full bg-white/10">
+        <div
+          className="h-full rounded-full bg-[#d4a017] transition-[width] duration-100"
+          style={{ width: `${progress * 100}%` }}
+        />
+      </div>
+
+      {error ? (
+        <p className="rounded-xl border border-red-400/30 bg-red-400/10 px-4 py-3 text-red-200">
+          {error}
+        </p>
+      ) : null}
+
+      <div className="flex flex-wrap items-center gap-4">
+        <button
+          type="button"
+          onClick={onStart}
+          disabled={capturing}
+          className="rounded-full bg-[#d4a017] px-6 py-3 text-sm font-semibold text-[#0b1220] disabled:opacity-60"
+        >
+          {capturing
+            ? settling
+              ? "Get into position…"
+              : "Hold it…"
+            : error
+              ? "Try again"
+              : "Start"}
+        </button>
+        <button
+          type="button"
+          onClick={onSkip}
+          disabled={capturing}
+          className="rounded-full border border-white/15 px-6 py-3 text-sm disabled:opacity-60"
+        >
+          Skip (use default 30%)
+        </button>
+      </div>
+    </main>
+  );
+}
+
+// Two-position slider for the typing mode; the thumb slides to the active one.
+function EntrySlider({
   value,
   onChange,
 }: {
-  label: string;
-  options: Array<{ id: T; label: string }>;
-  value: T;
-  onChange: (value: T) => void;
+  value: Entry;
+  onChange: (value: Entry) => void;
 }) {
+  const index = ENTRIES.findIndex((option) => option.id === value);
   return (
-    <div className="flex items-center gap-1 rounded-full border border-white/15 p-1 text-sm">
-      <span className="px-2 text-[#c8c0b0]">{label}</span>
-      {options.map((option) => (
+    <div
+      role="radiogroup"
+      aria-label="Typing mode"
+      className="relative grid grid-cols-2 rounded-full bg-[#0b1220]/10 p-1 text-sm font-semibold"
+    >
+      <span
+        aria-hidden
+        className="absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-full bg-[#0b1220] transition-transform duration-300 ease-out"
+        style={{ transform: `translateX(${index * 100}%)` }}
+      />
+      {ENTRIES.map((option) => (
         <button
           key={option.id}
           type="button"
+          role="radio"
+          aria-checked={value === option.id}
           onClick={() => onChange(option.id)}
-          className={`rounded-full px-3 py-1 ${
-            value === option.id
-              ? "bg-[#d4a017] text-[#0b1220]"
-              : "text-[#f4efe4]"
+          className={`relative rounded-full px-4 py-1.5 transition-colors ${
+            value === option.id ? "text-[#f4efe4]" : "text-[#0b1220]/55"
           }`}
         >
           {option.label}
@@ -1000,7 +1360,6 @@ function Keyboard({
         progress={progress}
         isActiveCalib={isActiveCalib}
         dimmed={calibrating && !isActiveCalib}
-        showZone={!calibrating}
         cycling={pending?.keyId === key.id ? pending.index : null}
         onClick={() => onKeyClick(key)}
         setKeyNode={setKeyNode}
@@ -1046,7 +1405,6 @@ function KeyButton({
   progress,
   isActiveCalib,
   dimmed,
-  showZone,
   cycling,
   onClick,
   setKeyNode,
@@ -1058,7 +1416,6 @@ function KeyButton({
   progress: number;
   isActiveCalib: boolean;
   dimmed: boolean;
-  showZone: boolean;
   cycling: number | null;
   onClick: () => void;
   setKeyNode: (id: string, node: HTMLElement | null) => void;
@@ -1090,13 +1447,6 @@ function KeyButton({
             isActiveCalib ? "bg-[#0b1220]/20" : "bg-[#d4a017]/35"
           }`}
           style={{ height: `${progress * 100}%` }}
-        />
-      ) : null}
-      {showZone ? (
-        <span
-          aria-hidden
-          className="pointer-events-none absolute rounded-xl border border-dashed border-white/15"
-          style={{ inset: `${((1 - SNAP_ZONE) / 2) * 100}%` }}
         />
       ) : null}
       {compact ? (

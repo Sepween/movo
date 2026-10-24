@@ -96,9 +96,17 @@ const RELEASE_ZONE = 0.75;
 
 // Distance from the key centre in units of half the key size (Chebyshev), so
 // a value of 1 is the key's edge whatever its shape.
-function keyDistance(x: number, y: number, rect: DOMRect) {
+//
+// A node marked data-snap="row" is a full-width strip: left/right position is
+// ignored and its whole height snaps (scaled so its edge lands on SNAP_ZONE).
+function keyDistance(x: number, y: number, node: HTMLElement) {
+  const rect = node.getBoundingClientRect();
   const dx = (x - (rect.left + rect.width / 2)) / Math.max(rect.width / 2, 1);
   const dy = (y - (rect.top + rect.height / 2)) / Math.max(rect.height / 2, 1);
+  if (node.dataset.snap === "row") {
+    const insideX = x >= rect.left && x <= rect.right;
+    return insideX ? Math.abs(dy) * SNAP_ZONE : Infinity;
+  }
   return Math.max(Math.abs(dx), Math.abs(dy));
 }
 
@@ -109,13 +117,13 @@ export function pickGazeKey(
   nodes: Map<string, HTMLElement>,
 ) {
   if (currentId) {
-    const rect = nodes.get(currentId)?.getBoundingClientRect();
-    if (rect && keyDistance(x, y, rect) <= RELEASE_ZONE) return currentId;
+    const node = nodes.get(currentId);
+    if (node && keyDistance(x, y, node) <= RELEASE_ZONE) return currentId;
   }
 
-  // Every registered key, including the T9 suggestion buttons.
+  // Every registered key, including suggestions and the scroll strips.
   for (const [id, node] of nodes) {
-    if (keyDistance(x, y, node.getBoundingClientRect()) <= SNAP_ZONE) return id;
+    if (keyDistance(x, y, node) <= SNAP_ZONE) return id;
   }
   return null;
 }
