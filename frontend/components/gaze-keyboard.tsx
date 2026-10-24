@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   applyKey,
   CALIBRATION_KEYS,
@@ -15,6 +15,13 @@ import {
   type KeyDef,
 } from "@/lib/keyboard";
 import { createFaceLandmarker, HeadTracker } from "@/lib/head";
+import {
+  isWordDigit,
+  loadDictionary,
+  previewWord,
+  suggest,
+  type Dictionary,
+} from "@/lib/t9";
 import {
   faceInBox,
   precisionScore,
@@ -38,6 +45,16 @@ const CAPTURE_MS = 1000;
 const SETTLE_MS = 250;
 const MIN_CAPTURE_SAMPLES = 8;
 const SENSITIVITIES = [1, 1.5, 2] as const;
+const SUGGESTION_COUNT = 4;
+const SUGGESTION_PREFIX = "suggest-";
+
+// Predictive: one press per letter, words come from the dictionary.
+// Multi-tap: press (or keep pointing) to cycle a key's letters.
+type Entry = "predictive" | "multitap";
+const ENTRIES: Array<{ id: Entry; label: string }> = [
+  { id: "predictive", label: "Predictive" },
+  { id: "multitap", label: "Multi-tap" },
+];
 
 type Phase =
   | "start"
@@ -95,6 +112,9 @@ export function GazeKeyboard() {
   const [capturing, setCapturing] = useState(false);
   const [captureProgress, setCaptureProgress] = useState(0);
   const [sensitivity, setSensitivity] = useState<number>(1);
+  const [entry, setEntry] = useState<Entry>("predictive");
+  const [digits, setDigits] = useState("");
+  const [dict, setDict] = useState<Dictionary | null>(null);
 
   const keyNodes = useRef(new Map<string, HTMLElement>());
   const dwell = useRef<DwellState>(emptyDwell());
@@ -113,6 +133,10 @@ export function GazeKeyboard() {
   const captureStarted = useRef(0);
   const captureCount = useRef(0);
   const faceOkRef = useRef(false);
+  const entryRef = useRef<Entry>("predictive");
+  const digitsRef = useRef("");
+  const dictRef = useRef<Dictionary | null>(null);
+  const suggestionsRef = useRef<KeyDef[]>([]);
 
   phaseRef.current = phase;
   modeRef.current = mode;
@@ -123,7 +147,48 @@ export function GazeKeyboard() {
     else keyNodes.current.delete(id);
   }, []);
 
+  // Turns the digit sequence being typed into its best word.
+  const commitComposing = useCallback(() => {
+    const sequence = digitsRef.current;
+    if (!sequence) return;
+    const word = previewWord(dictRef.current, sequence);
+    digitsRef.current = "";
+    setDigits("");
+    setText((current) => current + word);
+  }, []);
+
+  const setSequence = useCallback((next: string) => {
+    digitsRef.current = next;
+    setDigits(next);
+  }, []);
+
   const typeKey = useCallback((key: KeyDef, continuing: boolean) => {
+    setFiredKey(key.id);
+    window.setTimeout(() => {
+      setFiredKey((current) => (current === key.id ? null : current));
+    }, 160);
+
+    if (key.id.startsWith(SUGGESTION_PREFIX)) {
+      cycleRef.current = null;
+      setPending(null);
+      setSequence("");
+      setText((current) => current + key.label + " ");
+      return;
+    }
+    if (entryRef.current === "predictive") {
+      if (isWordDigit(key.id)) {
+        cycleRef.current = null;
+        setPending(null);
+        setSequence(digitsRef.current + key.id);
+        return;
+      }
+      if (key.id === "backspace" && digitsRef.current) {
+        setSequence(digitsRef.current.slice(0, -1));
+        return;
+      }
+      commitComposing();
+    }
+
     if (key.chars) {
       const { cycle, replace } = nextCycle(
         key,
@@ -140,11 +205,22 @@ export function GazeKeyboard() {
       setPending(null);
       setText((current) => applyKey(current, key));
     }
-    setFiredKey(key.id);
-    window.setTimeout(() => {
-      setFiredKey((current) => (current === key.id ? null : current));
-    }, 160);
+  }, [commitComposing, setSequence]);
+
+  const resolveKey = useCallback((id: string) => {
+    if (!id.startsWith(SUGGESTION_PREFIX)) return findKey(id);
+    return suggestionsRef.current.find((key) => key.id === id) ?? null;
   }, []);
+
+  // Keeping the pointer on a key cycles its letters in multi-tap; in
+  // predictive mode only the punctuation key (1) still cycles.
+  const cyclesOnHold = useCallback(
+    (key: KeyDef | null) =>
+      Boolean(
+        key?.chars && (entryRef.current === "multitap" || !isWordDigit(key.id)),
+      ),
+    [],
+  );
 
   const applyGazePoint = useCallback(
     (point: Point) => {
@@ -155,13 +231,14 @@ export function GazeKeyboard() {
       if (hit && hit === state.keyId) {
         state.leftAt = null;
         state.pendingId = null;
-        const key = findKey(hit);
+        const key = resolveKey(hit);
         if (key && !state.fired && now - state.since >= DWELL_MS) {
           state.fired = true;
           state.lastFire = now;
           typeKey(key, false);
         } else if (
-          key?.chars &&
+          key &&
+          cyclesOnHold(key) &&
           state.fired &&
           now - state.lastFire >= CYCLE_MS
         ) {
@@ -194,13 +271,13 @@ export function GazeKeyboard() {
         let fill = 0;
         if (shown && !dwell.current.fired) {
           fill = (now - dwell.current.since) / DWELL_MS;
-        } else if (shown && findKey(shown)?.chars) {
+        } else if (shown && cyclesOnHold(resolveKey(shown))) {
           fill = (now - dwell.current.lastFire) / CYCLE_MS;
         }
         setProgress(Math.min(1, fill));
       }
     },
-    [typeKey],
+    [cyclesOnHold, resolveKey, typeKey],
   );
 
   // WebGazer calls this for every frame; route it by phase.
@@ -477,6 +554,47 @@ export function GazeKeyboard() {
     return () => window.clearTimeout(timer);
   }, [pending]);
 
+  useEffect(() => {
+    let cancelled = false;
+    loadDictionary()
+      .then((loaded) => {
+        if (cancelled) return;
+        dictRef.current = loaded;
+        setDict(loaded);
+      })
+      .catch(() => {
+        // Without a dictionary, predictive mode falls back to first letters.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const suggestions = useMemo<KeyDef[]>(
+    () =>
+      suggest(dict, digits, SUGGESTION_COUNT).map((word, index) => ({
+        id: `${SUGGESTION_PREFIX}${index}`,
+        label: word,
+      })),
+    [dict, digits],
+  );
+  const composing = useMemo(() => previewWord(dict, digits), [dict, digits]);
+
+  useEffect(() => {
+    suggestionsRef.current = suggestions;
+  }, [suggestions]);
+
+  const chooseEntry = useCallback(
+    (next: Entry) => {
+      commitComposing();
+      cycleRef.current = null;
+      setPending(null);
+      entryRef.current = next;
+      setEntry(next);
+    },
+    [commitComposing],
+  );
+
   const chooseSensitivity = useCallback((value: number) => {
     setSensitivity(value);
     if (trackerRef.current) trackerRef.current.sensitivity = value;
@@ -485,8 +603,9 @@ export function GazeKeyboard() {
   const clearText = useCallback(() => {
     cycleRef.current = null;
     setPending(null);
+    setSequence("");
     setText("");
-  }, []);
+  }, [setSequence]);
 
   const calibrating = phase === "calibrate" || phase === "measure";
   const showKeyboard = calibrating || phase === "result" || phase === "typing";
@@ -537,6 +656,25 @@ export function GazeKeyboard() {
             <header
               className={`mb-3 flex shrink-0 items-start justify-end gap-3 ${mode !== "mouse" ? "pl-48" : ""}`}
             >
+              <div className="mr-auto flex flex-wrap items-center gap-3">
+                <Segmented
+                  label="Typing"
+                  options={ENTRIES}
+                  value={entry}
+                  onChange={chooseEntry}
+                />
+                {mode === "head" ? (
+                  <Segmented
+                    label="Sensitivity"
+                    options={SENSITIVITIES.map((value) => ({
+                      id: value,
+                      label: `${value}×`,
+                    }))}
+                    value={sensitivity}
+                    onChange={chooseSensitivity}
+                  />
+                ) : null}
+              </div>
               <button
                 type="button"
                 onClick={clearText}
@@ -544,25 +682,6 @@ export function GazeKeyboard() {
               >
                 Clear
               </button>
-              {mode === "head" ? (
-                <div className="mr-auto flex items-center gap-1 rounded-full border border-white/15 p-1 text-sm">
-                  <span className="px-2 text-[#c8c0b0]">Sensitivity</span>
-                  {SENSITIVITIES.map((value) => (
-                    <button
-                      key={value}
-                      type="button"
-                      onClick={() => chooseSensitivity(value)}
-                      className={`rounded-full px-3 py-1 ${
-                        sensitivity === value
-                          ? "bg-[#d4a017] text-[#0b1220]"
-                          : "text-[#f4efe4]"
-                      }`}
-                    >
-                      {value}×
-                    </button>
-                  ))}
-                </div>
-              ) : null}
               {mode !== "mouse" ? (
                 <button
                   type="button"
@@ -595,8 +714,10 @@ export function GazeKeyboard() {
                   : mode === "eye"
                     ? "Gaze output"
                     : "Mouse practice"}{" "}
-                · hold a key
-                for 1s, keep holding to cycle letters
+                ·{" "}
+                {entry === "predictive"
+                  ? "one press per letter, then pick a word or press 0"
+                  : "hold a key for 1s, keep holding to cycle letters"}
               </p>
               <p className="mt-2 min-h-16 font-mono text-2xl leading-snug break-words whitespace-pre-wrap sm:text-3xl">
                 {pending ? (
@@ -609,6 +730,11 @@ export function GazeKeyboard() {
                 ) : (
                   text
                 )}
+                {composing ? (
+                  <span className="rounded bg-[#d4a017]/40 underline decoration-2 underline-offset-4">
+                    {composing}
+                  </span>
+                ) : null}
                 <span className="ml-0.5 inline-block w-[2px] animate-pulse bg-[#0b1220] align-baseline">
                   &nbsp;
                 </span>
@@ -629,6 +755,10 @@ export function GazeKeyboard() {
             }
             firedKey={phase === "typing" ? firedKey : null}
             pending={phase === "typing" ? pending : null}
+            suggestions={
+              phase === "typing" && entry === "predictive" ? suggestions : null
+            }
+            composing={digits.length > 0}
             calibrating={calibrating}
             activeCalibKey={activeCalibKey}
             onKeyClick={onKeyClick}
@@ -766,8 +896,8 @@ function StartScreen({
           each key and click it {CLICKS_PER_POINT} times.
         </li>
         <li className="rounded-2xl border border-white/10 bg-white/5 p-4">
-          Point at a key for 1 second to type its first letter. Keep pointing
-          to cycle to the next one, then move away to keep it.
+          Point at a key for 1 second to press it. Press each letter&apos;s key
+          once (4-6-6-3 for &ldquo;good&rdquo;), then pick a suggestion.
         </li>
       </ol>
       {error ? (
@@ -802,11 +932,45 @@ function StartScreen({
   );
 }
 
+function Segmented<T extends string | number>({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  options: Array<{ id: T; label: string }>;
+  value: T;
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1 rounded-full border border-white/15 p-1 text-sm">
+      <span className="px-2 text-[#c8c0b0]">{label}</span>
+      {options.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          onClick={() => onChange(option.id)}
+          className={`rounded-full px-3 py-1 ${
+            value === option.id
+              ? "bg-[#d4a017] text-[#0b1220]"
+              : "text-[#f4efe4]"
+          }`}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function Keyboard({
   hoveredKey,
   progress,
   firedKey,
   pending,
+  suggestions,
+  composing,
   calibrating,
   activeCalibKey,
   onKeyClick,
@@ -816,83 +980,148 @@ function Keyboard({
   progress: number;
   firedKey: string | null;
   pending: Cycle | null;
+  // null hides the suggestion row (multi-tap or calibration).
+  suggestions: KeyDef[] | null;
+  composing: boolean;
   calibrating: boolean;
   activeCalibKey: string | null;
   onKeyClick: (key: KeyDef) => void;
   setKeyNode: (id: string, node: HTMLElement | null) => void;
 }) {
+  const button = (key: KeyDef, compact = false) => {
+    const isActiveCalib = activeCalibKey === key.id;
+    return (
+      <KeyButton
+        key={key.id}
+        keyDef={key}
+        compact={compact}
+        hovered={hoveredKey === key.id}
+        fired={firedKey === key.id}
+        progress={progress}
+        isActiveCalib={isActiveCalib}
+        dimmed={calibrating && !isActiveCalib}
+        showZone={!calibrating}
+        cycling={pending?.keyId === key.id ? pending.index : null}
+        onClick={() => onKeyClick(key)}
+        setKeyNode={setKeyNode}
+      />
+    );
+  };
+
   return (
     <div className="mx-auto flex w-full max-w-4xl min-h-0 flex-1 flex-col justify-end gap-4">
+      {suggestions ? (
+        <div className="flex h-[min(5rem,10vh)] shrink-0 justify-center gap-3">
+          {Array.from({ length: SUGGESTION_COUNT }, (_, index) =>
+            suggestions[index] ? (
+              button(suggestions[index], true)
+            ) : (
+              <div
+                key={`empty-${index}`}
+                className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-white/10 text-sm text-[#c8c0b0]/60"
+              >
+                {index === 0 && composing ? "No match" : null}
+              </div>
+            ),
+          )}
+        </div>
+      ) : null}
       {KEY_ROWS.map((row, rowIndex) => (
         <div
           key={rowIndex}
           className="flex max-h-48 min-h-0 flex-1 justify-center gap-5"
         >
-          {row.map((key) => {
-            const hovered = hoveredKey === key.id;
-            const fired = firedKey === key.id;
-            const isActiveCalib = activeCalibKey === key.id;
-            const dimmed = calibrating && !isActiveCalib;
-            const cycling = pending?.keyId === key.id ? pending.index : null;
-            return (
-              <button
-                key={key.id}
-                type="button"
-                ref={(node) => setKeyNode(key.id, node)}
-                onClick={() => onKeyClick(key)}
-                disabled={calibrating && !isActiveCalib}
-                className="relative isolate h-full min-h-16 overflow-hidden rounded-2xl border font-semibold select-none"
-                style={{
-                  flex: `${key.width ?? 1} 1 0%`,
-                  opacity: dimmed ? 0.28 : 1,
-                  borderColor: fired || isActiveCalib
-                    ? "#d4a017"
-                    : hovered
-                      ? "rgba(212,160,23,0.9)"
-                      : "rgba(244,239,228,0.12)",
-                  background: fired || isActiveCalib ? "#d4a017" : "#151d2e",
-                  color: fired || isActiveCalib ? "#0b1220" : "#f4efe4",
-                }}
-              >
-                {hovered && !fired ? (
-                  <span
-                    className={`absolute inset-x-0 bottom-0 ${
-                      isActiveCalib ? "bg-[#0b1220]/20" : "bg-[#d4a017]/35"
-                    }`}
-                    style={{ height: `${progress * 100}%` }}
-                  />
-                ) : null}
-                {!calibrating ? (
-                  <span
-                    aria-hidden
-                    className="pointer-events-none absolute rounded-xl border border-dashed border-white/15"
-                    style={{ inset: `${((1 - SNAP_ZONE) / 2) * 100}%` }}
-                  />
-                ) : null}
-                <span className="relative flex flex-col items-center leading-none">
-                  <span className="text-2xl sm:text-3xl">{key.label}</span>
-                  <span className="mt-1.5 font-mono text-sm tracking-[0.2em] uppercase opacity-70 sm:text-base">
-                    {cycling !== null && key.chars
-                      ? key.chars.map((char, index) => (
-                          <span
-                            key={index}
-                            className={
-                              index === cycling
-                                ? "text-[#d4a017] underline opacity-100"
-                                : ""
-                            }
-                          >
-                            {char}
-                          </span>
-                        ))
-                      : key.sub}
-                  </span>
-                </span>
-              </button>
-            );
-          })}
+          {row.map((key) => button(key))}
         </div>
       ))}
     </div>
+  );
+}
+
+function KeyButton({
+  keyDef: key,
+  compact,
+  hovered,
+  fired,
+  progress,
+  isActiveCalib,
+  dimmed,
+  showZone,
+  cycling,
+  onClick,
+  setKeyNode,
+}: {
+  keyDef: KeyDef;
+  compact: boolean;
+  hovered: boolean;
+  fired: boolean;
+  progress: number;
+  isActiveCalib: boolean;
+  dimmed: boolean;
+  showZone: boolean;
+  cycling: number | null;
+  onClick: () => void;
+  setKeyNode: (id: string, node: HTMLElement | null) => void;
+}) {
+  return (
+    <button
+      type="button"
+      ref={(node) => setKeyNode(key.id, node)}
+      onClick={onClick}
+      disabled={dimmed}
+      className={`relative isolate h-full overflow-hidden rounded-2xl border font-semibold select-none ${
+        compact ? "" : "min-h-16"
+      }`}
+      style={{
+        flex: `${key.width ?? 1} 1 0%`,
+        opacity: dimmed ? 0.28 : 1,
+        borderColor: fired || isActiveCalib
+          ? "#d4a017"
+          : hovered
+            ? "rgba(212,160,23,0.9)"
+            : "rgba(244,239,228,0.12)",
+        background: fired || isActiveCalib ? "#d4a017" : "#151d2e",
+        color: fired || isActiveCalib ? "#0b1220" : "#f4efe4",
+      }}
+    >
+      {hovered && !fired ? (
+        <span
+          className={`absolute inset-x-0 bottom-0 ${
+            isActiveCalib ? "bg-[#0b1220]/20" : "bg-[#d4a017]/35"
+          }`}
+          style={{ height: `${progress * 100}%` }}
+        />
+      ) : null}
+      {showZone ? (
+        <span
+          aria-hidden
+          className="pointer-events-none absolute rounded-xl border border-dashed border-white/15"
+          style={{ inset: `${((1 - SNAP_ZONE) / 2) * 100}%` }}
+        />
+      ) : null}
+      {compact ? (
+        <span className="relative text-xl sm:text-2xl">{key.label}</span>
+      ) : (
+        <span className="relative flex flex-col items-center leading-none">
+          <span className="text-2xl sm:text-3xl">{key.label}</span>
+          <span className="mt-1.5 font-mono text-sm tracking-[0.2em] uppercase opacity-70 sm:text-base">
+            {cycling !== null && key.chars
+              ? key.chars.map((char, index) => (
+                  <span
+                    key={index}
+                    className={
+                      index === cycling
+                        ? "text-[#d4a017] underline opacity-100"
+                        : ""
+                    }
+                  >
+                    {char}
+                  </span>
+                ))
+              : key.sub}
+          </span>
+        </span>
+      )}
+    </button>
   );
 }

@@ -113,9 +113,9 @@ export function pickGazeKey(
     if (rect && keyDistance(x, y, rect) <= RELEASE_ZONE) return currentId;
   }
 
-  for (const key of KEY_ROWS.flat()) {
-    const rect = nodes.get(key.id)?.getBoundingClientRect();
-    if (rect && keyDistance(x, y, rect) <= SNAP_ZONE) return key.id;
+  // Every registered key, including the T9 suggestion buttons.
+  for (const [id, node] of nodes) {
+    if (keyDistance(x, y, node.getBoundingClientRect()) <= SNAP_ZONE) return id;
   }
   return null;
 }
