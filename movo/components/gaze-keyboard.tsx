@@ -1593,11 +1593,15 @@ function IntroScreen({ leaving }: { leaving: boolean }) {
         animation: "movo-fade-in 700ms ease-out",
       }}
     >
+      {/* Served as-is (unoptimized) so replacing public/movo_logo.png shows up
+          right away instead of after the optimizer's 4-hour cache. Keep
+          width/height in step with the file's pixel size. */}
       <Image
         src="/movo_logo.png"
         alt="movo"
-        width={893}
-        height={279}
+        width={963}
+        height={259}
+        unoptimized
         priority
         className="h-auto w-[min(26rem,70vw)]"
       />
