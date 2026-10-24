@@ -28,7 +28,7 @@ import {
   type HeadPose,
 } from "@/lib/head";
 import { speakText } from "@/lib/speech";
-import { AddVoice } from "@/lib/voice";
+import { AddVoice, AddWords } from "@/lib/voice";
 import {
   isWordDigit,
   loadDictionary,
@@ -146,6 +146,7 @@ const PAUSE_KEY_IDS = new Set([
 ]);
 const RESULT_KEY_IDS = new Set([START_TYPING_KEY.id, RECALIBRATE_KEY.id]);
 const SUGGESTION_COUNT = 4;
+const SUGGESTION_POOL = 16;
 const SUGGESTION_PREFIX = "suggest-";
 
 // Predictive: one press per letter, words come from the dictionary.
@@ -913,15 +914,33 @@ export function GazeKeyboard() {
     };
   }, []);
 
-  const suggestions = useMemo<KeyDef[]>(
-    () =>
-      suggest(dict, digits, SUGGESTION_COUNT).map((word, index) => ({
-        id: `${SUGGESTION_PREFIX}${index}`,
-        label: word,
-      })),
+  const [suggestPage, setSuggestPage] = useState(0);
+  const suggestionPool = useMemo(
+    () => suggest(dict, digits, SUGGESTION_POOL),
     [dict, digits],
   );
+  const suggestPages = Math.max(
+    1,
+    Math.ceil(suggestionPool.length / SUGGESTION_COUNT),
+  );
+  const suggestions = useMemo<KeyDef[]>(
+    () =>
+      suggestionPool
+        .slice(
+          suggestPage * SUGGESTION_COUNT,
+          suggestPage * SUGGESTION_COUNT + SUGGESTION_COUNT,
+        )
+        .map((word, index) => ({
+          id: `${SUGGESTION_PREFIX}${index}`,
+          label: word,
+        })),
+    [suggestionPool, suggestPage],
+  );
   const composing = useMemo(() => previewWord(dict, digits), [dict, digits]);
+
+  useEffect(() => {
+    setSuggestPage(0);
+  }, [digits]);
 
   useEffect(() => {
     suggestionsRef.current = suggestions;
@@ -1124,6 +1143,9 @@ export function GazeKeyboard() {
               suggestions={
                 phase === "typing" && entry === "predictive" ? suggestions : null
               }
+              suggestPage={suggestPage}
+              suggestPages={suggestPages}
+              onSuggestPage={setSuggestPage}
               composing={digits.length > 0}
               calibrating={calibrating}
               activeCalibKey={activeCalibKey}
@@ -1308,6 +1330,7 @@ function StartScreen({
         </p>
       ) : null}
       <AddVoice />
+      <AddWords />
       <div className="flex flex-wrap items-center gap-4">
         <button
           type="button"
@@ -1453,6 +1476,9 @@ function Keyboard({
   firedKey,
   pending,
   suggestions,
+  suggestPage,
+  suggestPages,
+  onSuggestPage,
   composing,
   calibrating,
   activeCalibKey,
@@ -1465,6 +1491,9 @@ function Keyboard({
   pending: Cycle | null;
   // null hides the suggestion row (multi-tap or calibration).
   suggestions: KeyDef[] | null;
+  suggestPage: number;
+  suggestPages: number;
+  onSuggestPage: (page: number) => void;
   composing: boolean;
   calibrating: boolean;
   activeCalibKey: string | null;
@@ -1493,19 +1522,39 @@ function Keyboard({
   return (
     <div className="mx-auto flex w-full max-w-4xl min-h-0 flex-1 flex-col justify-end gap-4">
       {suggestions ? (
-        <div className="flex h-[min(5rem,10vh)] shrink-0 justify-center gap-3">
-          {Array.from({ length: SUGGESTION_COUNT }, (_, index) =>
-            suggestions[index] ? (
-              button(suggestions[index], true)
-            ) : (
-              <div
-                key={`empty-${index}`}
-                className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-white/10 text-sm text-[#c8c0b0]/60"
-              >
-                {index === 0 && composing ? "No match" : null}
-              </div>
-            ),
-          )}
+        <div className="flex h-[min(5rem,10vh)] shrink-0 items-stretch gap-2">
+          <button
+            type="button"
+            aria-label="Previous suggestions"
+            disabled={suggestPage <= 0}
+            onClick={() => onSuggestPage(suggestPage - 1)}
+            className="w-10 shrink-0 rounded-2xl border border-white/15 text-2xl disabled:opacity-25"
+          >
+            ‹
+          </button>
+          <div className="flex min-w-0 flex-1 justify-center gap-3">
+            {Array.from({ length: SUGGESTION_COUNT }, (_, index) =>
+              suggestions[index] ? (
+                button(suggestions[index], true)
+              ) : (
+                <div
+                  key={`empty-${index}`}
+                  className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-white/10 text-sm text-[#c8c0b0]/60"
+                >
+                  {index === 0 && composing ? "No match" : null}
+                </div>
+              ),
+            )}
+          </div>
+          <button
+            type="button"
+            aria-label="Next suggestions"
+            disabled={suggestPage >= suggestPages - 1}
+            onClick={() => onSuggestPage(suggestPage + 1)}
+            className="w-10 shrink-0 rounded-2xl border border-white/15 text-2xl disabled:opacity-25"
+          >
+            ›
+          </button>
         </div>
       ) : null}
       {KEY_ROWS.map((row, rowIndex) => (

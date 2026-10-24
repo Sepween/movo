@@ -1,11 +1,14 @@
 // Predictive T9: each key press adds one digit, and the dictionary turns the
 // digit sequence into candidate words (e.g. 223 -> "bad", "cad", "ace").
 //
-// The word list (public/t9/words.txt) is the 10k most common English words
-// from the Google Web Trillion Word Corpus, most frequent first, so list
-// order doubles as ranking. See public/t9/LICENSE.md.
+// The full word list (public/t9/words.txt) is kept for coverage. The Google
+// 10k (public/t9/common.txt) is loaded first, most frequent first, so popular
+// matches always rank above the long tail. Patient names in localStorage sit
+// above both. See public/t9/LICENSE.md.
 
+const COMMON_URL = "/t9/common.txt";
 const WORDS_URL = "/t9/words.txt";
+const CUSTOM_KEY = "t9-custom-words";
 
 const KEYPAD: Record<string, string> = {
   "2": "abc",
@@ -38,48 +41,110 @@ export function wordToDigits(word: string) {
   return digits;
 }
 
-export type Dictionary = {
-  // In frequency order.
-  entries: Array<{ word: string; digits: string }>;
-  exact: Map<string, string[]>;
-};
-
-export async function loadDictionary(): Promise<Dictionary> {
-  const response = await fetch(WORDS_URL);
-  if (!response.ok) throw new Error("Could not load the T9 dictionary.");
-  const entries: Dictionary["entries"] = [];
-  const exact = new Map<string, string[]>();
-  for (const line of (await response.text()).split("\n")) {
-    const word = line.trim().toLowerCase();
-    const digits = word ? wordToDigits(word) : null;
-    if (!digits) continue;
-    entries.push({ word, digits });
-    exact.set(digits, [...(exact.get(digits) ?? []), word]);
-  }
-  return { entries, exact };
+function letters(word: string) {
+  return word.toLowerCase().replace(/[^a-z]/g, "");
 }
 
-// Exact-length matches first (what classic T9 shows), then longer words that
-// start with the sequence, so a word can be picked before it's fully typed.
+export function loadCustomWords(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CUSTOM_KEY) ?? "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((word): word is string => typeof word === "string");
+  } catch {
+    return [];
+  }
+}
+
+function saveCustomWords(words: string[]) {
+  localStorage.setItem(CUSTOM_KEY, JSON.stringify(words));
+}
+
+export function addCustomWord(raw: string) {
+  const word = raw.trim();
+  const key = letters(word);
+  if (key.length < 2) return "Use at least two letters.";
+  if (!wordToDigits(key)) return "Could not add that word.";
+  saveCustomWords([
+    word,
+    ...loadCustomWords().filter((existing) => letters(existing) !== key),
+  ]);
+  return "";
+}
+
+export function removeCustomWord(word: string) {
+  const key = letters(word);
+  saveCustomWords(loadCustomWords().filter((existing) => letters(existing) !== key));
+}
+
+function customEntries() {
+  const entries: Dictionary["entries"] = [];
+  const seen = new Set<string>();
+  for (const word of loadCustomWords()) {
+    const key = letters(word);
+    if (seen.has(key)) continue;
+    const digits = wordToDigits(key);
+    if (!digits) continue;
+    seen.add(key);
+    entries.push({ word, digits });
+  }
+  return entries;
+}
+
+export type Dictionary = {
+  // Common 10k first (frequency order), then the rest of the lexicon.
+  entries: Array<{ word: string; digits: string }>;
+};
+
+async function parseList(url: string, seen: Set<string>) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("Could not load the T9 dictionary.");
+  const entries: Dictionary["entries"] = [];
+  for (const line of (await response.text()).split("\n")) {
+    const word = line.trim().toLowerCase();
+    if (!word || seen.has(word)) continue;
+    const digits = wordToDigits(word);
+    if (!digits) continue;
+    seen.add(word);
+    entries.push({ word, digits });
+  }
+  return entries;
+}
+
+export async function loadDictionary(): Promise<Dictionary> {
+  const seen = new Set<string>();
+  const common = await parseList(COMMON_URL, seen);
+  const rest = await parseList(WORDS_URL, seen);
+  return { entries: [...common, ...rest] };
+}
+
+// Custom names first, then the 10k, then the long tail.
 export function suggest(dict: Dictionary | null, digits: string, limit: number) {
-  if (!dict || !digits) return [];
-  const words = [...(dict.exact.get(digits) ?? [])].slice(0, limit);
+  if (!digits) return [];
+  const words: string[] = [];
+  const skip = new Set<string>();
+  for (const entry of customEntries()) {
+    if (!entry.digits.startsWith(digits)) continue;
+    words.push(entry.word);
+    skip.add(letters(entry.word));
+    if (words.length >= limit) return words;
+  }
+  if (!dict) return words;
   for (const entry of dict.entries) {
+    if (!entry.digits.startsWith(digits)) continue;
+    if (skip.has(entry.word)) continue;
+    words.push(entry.word);
     if (words.length >= limit) break;
-    if (entry.digits.length > digits.length && entry.digits.startsWith(digits)) {
-      words.push(entry.word);
-    }
   }
   return words;
 }
 
-// What to show (and commit on space) for the current sequence: the top exact
-// match, else the start of the top longer match, else each key's first letter.
 export function previewWord(dict: Dictionary | null, digits: string) {
   if (!digits) return "";
-  const exact = dict?.exact.get(digits)?.[0];
-  if (exact) return exact;
-  const longer = dict?.entries.find((entry) => entry.digits.startsWith(digits));
-  if (longer) return longer.word.slice(0, digits.length);
-  return [...digits].map((digit) => KEYPAD[digit]?.[0] ?? "").join("");
+  const hit =
+    customEntries().find((entry) => entry.digits.startsWith(digits)) ??
+    dict?.entries.find((entry) => entry.digits.startsWith(digits));
+  if (!hit) {
+    return [...digits].map((digit) => KEYPAD[digit]?.[0] ?? "").join("");
+  }
+  return hit.digits === digits ? hit.word : hit.word.slice(0, digits.length);
 }
