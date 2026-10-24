@@ -13,43 +13,40 @@ type Store = { voices: Voice[]; selected: string };
 const KEY = "elevenlabs-voices";
 const LEGACY = "elevenlabs-voice-id";
 
-const DISPLAY_NAMES = ["Shrenik Voice", "Evelyn Voice"] as const;
-
-const DEFAULTS: Voice[] = [
+const SHARED: Voice[] = [
   { id: "pNInz6obpgDQGcFmaJgB", name: "Male default" },
   { id: "21m00Tcm4TlvDq8ikWAM", name: "Female default" },
+  { id: "loK43gIA95yp5GIVlO9e", name: "Shrenik Voice" },
+  { id: "7c2w1GgwcQy5wC2IMFEj", name: "Evelyn Voice" },
 ];
 
-function options(store: Store): Voice[] {
-  return [...DEFAULTS, ...store.voices];
-}
+const SHARED_IDS = new Set(SHARED.map((voice) => voice.id));
 
-function named(store: Store): Store {
-  const voices = store.voices.map((voice, index) => ({
-    ...voice,
-    name: DISPLAY_NAMES[index] ?? voice.name,
-  }));
-  return { ...store, voices };
+function options(store: Store): Voice[] {
+  return [
+    ...SHARED,
+    ...store.voices.filter((voice) => !SHARED_IDS.has(voice.id)),
+  ];
 }
 
 function load(): Store {
-  let store: Store = { voices: [], selected: DEFAULTS[0].id };
+  let store: Store = { voices: [], selected: SHARED[0].id };
   try {
     const raw = localStorage.getItem(KEY);
-    if (raw) store = named(JSON.parse(raw) as Store);
+    if (raw) store = JSON.parse(raw) as Store;
     else {
       const legacy = localStorage.getItem(LEGACY);
       if (legacy) {
-        store = named({
+        store = {
           voices: [{ id: legacy, name: "Voice 1" }],
           selected: legacy,
-        });
+        };
       }
     }
   } catch {
     /* ignore */
   }
-  if (!store.selected) store.selected = DEFAULTS[0].id;
+  if (!store.selected) store.selected = SHARED[0].id;
   return store;
 }
 
@@ -61,7 +58,7 @@ function save(store: Store) {
 let audio: HTMLAudioElement | null = null;
 
 export async function speakCloned(text: string) {
-  const selected = load().selected || DEFAULTS[0].id;
+  const selected = load().selected || SHARED[0].id;
   const trimmed = text.trim();
   if (!trimmed) return;
   const body = new FormData();
@@ -89,7 +86,7 @@ export function AddVoice() {
   const input = useRef<HTMLInputElement>(null);
   const [store, setStore] = useState<Store>({
     voices: [],
-    selected: DEFAULTS[0].id,
+    selected: SHARED[0].id,
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -141,7 +138,7 @@ export function AddVoice() {
           </p>
         ) : null}
         <select
-          value={store.selected || DEFAULTS[0].id}
+          value={store.selected || SHARED[0].id}
           onChange={(event) => {
             const next = { ...load(), selected: event.target.value };
             save(next);
