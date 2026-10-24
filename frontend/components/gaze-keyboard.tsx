@@ -19,6 +19,7 @@ import {
   type EyeOpenness,
 } from "@/lib/head";
 import { speakText } from "@/lib/speech";
+import { AddVoice } from "@/lib/voice";
 import {
   isWordDigit,
   loadDictionary,
@@ -1165,6 +1166,7 @@ function StartScreen({
           {error}
         </p>
       ) : null}
+      <AddVoice />
       <div className="flex flex-wrap items-center gap-4">
         <button
           type="button"
