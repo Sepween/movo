@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Gaze Keyboard",
-  description: "Type by looking at keys with your webcam.",
+  title: "Movo",
+  description: "Type and speak with small head movements.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

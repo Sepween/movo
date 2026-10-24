@@ -29,7 +29,7 @@ const RIGHT_EYE_OUTER = 263;
 const NOSE_TIP = 1;
 
 // Cursor movement per unit of head turn, around the centre calibration key.
-const SENSITIVITY = 0.75;
+export const DEFAULT_SENSITIVITY = 0.75;
 
 // Eye-aspect-ratio landmarks [corner, top, top, corner, bottom, bottom],
 // named from the user's own point of view (MediaPipe's "left eye" is the
@@ -323,7 +323,27 @@ class OneEuro {
   }
 }
 
+// MediaPipe's WASM writes its own status lines to the console (e.g.
+// "INFO: Created TensorFlow Lite XNNPACK delegate for CPU.", and glog-style
+// "I0000 …"/"W0000 …" lines). They're harmless but show up as errors in the
+// Next.js dev overlay, so drop just those; everything else passes through.
+const MEDIAPIPE_NOISE = /^(INFO:|[IW]\d{4} )/;
+let consoleFiltered = false;
+
+function silenceMediaPipeLogs() {
+  if (consoleFiltered) return;
+  consoleFiltered = true;
+  for (const method of ["log", "info", "warn", "error"] as const) {
+    const original = console[method].bind(console);
+    console[method] = (...args: unknown[]) => {
+      if (typeof args[0] === "string" && MEDIAPIPE_NOISE.test(args[0])) return;
+      original(...args);
+    };
+  }
+}
+
 export async function createFaceLandmarker(): Promise<FaceLandmarker> {
+  silenceMediaPipeLogs();
   const { FaceLandmarker, FilesetResolver } = await import(
     "@mediapipe/tasks-vision"
   );
@@ -361,6 +381,7 @@ export class HeadTracker {
   private filterX = new OneEuro(0.6, 0.02);
   private filterY = new OneEuro(0.6, 0.02);
   private winks = new WinkDetector();
+  sensitivity = DEFAULT_SENSITIVITY;
 
   constructor(landmarker: FaceLandmarker) {
     this.landmarker = landmarker;
@@ -421,7 +442,7 @@ export class HeadTracker {
     this.samples.push({ ...pose, ...point });
   }
 
-  // `anchor` is the screen point SENSITIVITY scales around (the first,
+  // `anchor` is the screen point `sensitivity` scales around (the first,
   // centre calibration target).
   fit(anchor: Point) {
     this.map = fitAffine(this.samples);
@@ -446,11 +467,11 @@ export class HeadTracker {
     const rawY = m.y[0] * pose.yaw + m.y[1] * pose.pitch + m.y[2];
     const now = performance.now();
     const x = this.filterX.filter(
-      this.anchor.x + (rawX - this.anchor.x) * SENSITIVITY,
+      this.anchor.x + (rawX - this.anchor.x) * this.sensitivity,
       now,
     );
     const y = this.filterY.filter(
-      this.anchor.y + (rawY - this.anchor.y) * SENSITIVITY,
+      this.anchor.y + (rawY - this.anchor.y) * this.sensitivity,
       now,
     );
     return {

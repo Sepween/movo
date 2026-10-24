@@ -96,8 +96,8 @@ export function keyCenter(id: string, nodes: Map<string, HTMLElement>) {
 // The pointer must enter the inner zone to grab a key, and keeps it until it
 // leaves the slightly larger release zone, which stops flicker at the edge.
 // Outside every zone nothing is selected.
-export const SNAP_ZONE = 0.55;
-const RELEASE_ZONE = 0.75;
+export const SNAP_ZONE = 0.9;
+const RELEASE_ZONE = 1.05;
 
 // Distance from the key centre in units of half the key size (Chebyshev), so
 // a value of 1 is the key's edge whatever its shape.

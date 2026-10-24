@@ -1,12 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import {
-  addCustomWord,
-  loadCustomWords,
-  removeCustomWord,
-} from "@/lib/t9";
-
+import { useRef, useState } from "react";
 type Voice = { id: string; name: string };
 type Store = { voices: Voice[]; selected: string };
 
@@ -82,21 +76,34 @@ function labelFor(file: File, existing: Voice[]) {
   return `${base} ${n}`;
 }
 
-export function AddVoice() {
-  const input = useRef<HTMLInputElement>(null);
-  const [store, setStore] = useState<Store>({
-    voices: [],
-    selected: SHARED[0].id,
-  });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+export type { Voice };
 
-  useEffect(() => setStore(load()), []);
+// Every voice the patient can pick from: the shared defaults, then uploads.
+export function voiceOptions(): Voice[] {
+  return options(load());
+}
+
+export function selectedVoiceId(): string {
+  return load().selected || SHARED[0].id;
+}
+
+export function selectVoice(id: string) {
+  save({ ...load(), selected: id });
+}
+
+// Caretaker-only: upload a recording (audio or .mp4) to clone a new voice.
+// The new voice becomes the selected one.
+export function AddVoiceButton({ onAdded }: { onAdded: () => void }) {
+  const input = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
 
   const pick = (file: File | undefined) => {
     if (!file) return;
     setBusy(true);
     setError("");
+    setStatus("");
     const name = labelFor(file, load().voices);
     const body = new FormData();
     body.set("file", file);
@@ -105,12 +112,12 @@ export function AddVoice() {
       .then(async (res) => {
         const data = (await res.json()) as { voiceId?: string; error?: string };
         if (!res.ok || !data.voiceId) throw new Error(data.error ?? "Clone failed");
-        const next: Store = {
+        save({
           voices: [...load().voices, { id: data.voiceId, name }],
           selected: data.voiceId,
-        };
-        save(next);
-        setStore(next);
+        });
+        setStatus(`Added “${name}”`);
+        onAdded();
       })
       .catch((err: unknown) =>
         setError(err instanceof Error ? err.message : "Clone failed"),
@@ -119,11 +126,11 @@ export function AddVoice() {
   };
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col items-start gap-1">
       <input
         ref={input}
         type="file"
-        accept="audio/*"
+        accept="audio/*,video/mp4,.mp4,.m4a"
         className="hidden"
         onChange={(event) => {
           const file = event.target.files?.[0];
@@ -131,100 +138,16 @@ export function AddVoice() {
           pick(file);
         }}
       />
-      <div className="flex flex-wrap items-center gap-3">
-        {store.voices.length ? (
-          <p className="text-sm font-semibold tracking-wide text-[#d4a017]">
-            Voice Added!
-          </p>
-        ) : null}
-        <select
-          value={store.selected || SHARED[0].id}
-          onChange={(event) => {
-            const next = { ...load(), selected: event.target.value };
-            save(next);
-            setStore(next);
-          }}
-          className="rounded-full border border-white/15 bg-[#151d2e] px-4 py-2 text-sm"
-        >
-          {options(store).map((voice) => (
-            <option key={voice.id} value={voice.id}>
-              {voice.name}
-            </option>
-          ))}
-        </select>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => input.current?.click()}
-          className="rounded-full border border-white/15 px-4 py-2 text-sm disabled:opacity-50"
-        >
-          {busy ? "Cloning…" : store.voices.length ? "Add another" : "Add voice"}
-        </button>
-      </div>
-      {error ? <p className="text-sm text-red-200">{error}</p> : null}
-    </div>
-  );
-}
-
-export function AddWords() {
-  const [words, setWords] = useState<string[]>([]);
-  const [value, setValue] = useState("");
-  const [error, setError] = useState("");
-
-  useEffect(() => setWords(loadCustomWords()), []);
-
-  const submit = () => {
-    const nextError = addCustomWord(value);
-    if (nextError) {
-      setError(nextError);
-      return;
-    }
-    setValue("");
-    setError("");
-    setWords(loadCustomWords());
-  };
-
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-3">
-        <input
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter") return;
-            event.preventDefault();
-            submit();
-          }}
-          placeholder="Name or custom word"
-          className="rounded-full border border-white/15 bg-[#151d2e] px-4 py-2 text-sm"
-        />
-        <button
-          type="button"
-          onClick={submit}
-          className="rounded-full border border-white/15 px-4 py-2 text-sm"
-        >
-          Add word
-        </button>
-      </div>
-      {words.length ? (
-        <div className="flex flex-wrap gap-2">
-          {words.map((word) => (
-            <button
-              key={word}
-              type="button"
-              title="Remove"
-              onClick={() => {
-                removeCustomWord(word);
-                setWords(loadCustomWords());
-              }}
-              className="rounded-full border border-white/15 px-3 py-1 text-sm"
-            >
-              {word} ×
-            </button>
-          ))}
-        </div>
-      ) : null}
-      {error ? <p className="text-sm text-red-200">{error}</p> : null}
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => input.current?.click()}
+        className="rounded-full border border-[#0b1220]/15 px-5 py-2.5 text-sm disabled:opacity-50"
+      >
+        {busy ? "Cloning voice…" : "Add speaking voice"}
+      </button>
+      {status ? <p className="text-xs text-emerald-700">{status}</p> : null}
+      {error ? <p className="text-xs text-red-700">{error}</p> : null}
     </div>
   );
 }

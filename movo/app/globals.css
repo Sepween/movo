@@ -20,8 +20,8 @@
 }
 
 body {
-  background: #0b1220;
-  color: var(--foreground);
+  background: #f4efe4;
+  color: #0b1220;
   font-family: Arial, Helvetica, sans-serif;
 }
 
@@ -30,4 +30,13 @@ body {
 #webgazerVideoContainer {
   opacity: 0 !important;
   pointer-events: none;
+}
+
+@keyframes movo-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }

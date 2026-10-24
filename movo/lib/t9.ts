@@ -71,6 +71,21 @@ export function addCustomWord(raw: string) {
   return "";
 }
 
+// Changes the spelling of an existing word, keeping its place in the list.
+export function renameCustomWord(oldWord: string, raw: string) {
+  const word = raw.trim();
+  const key = letters(word);
+  if (key.length < 2) return "Use at least two letters.";
+  if (!wordToDigits(key)) return "Could not save that word.";
+  const oldKey = letters(oldWord);
+  const words = loadCustomWords();
+  if (words.some((w) => letters(w) === key && letters(w) !== oldKey)) {
+    return "That word is already in the list.";
+  }
+  saveCustomWords(words.map((w) => (letters(w) === oldKey ? word : w)));
+  return "";
+}
+
 export function removeCustomWord(word: string) {
   const key = letters(word);
   saveCustomWords(loadCustomWords().filter((existing) => letters(existing) !== key));
