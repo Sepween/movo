@@ -1,49 +1,29 @@
 export type KeyDef = {
   id: string;
   label: string;
+  sub?: string;
   insert?: string;
+  chars?: string[];
   width?: number;
 };
 
+function multiTap(digit: string, letters: string): KeyDef {
+  return {
+    id: digit,
+    label: digit,
+    sub: letters,
+    chars: [...letters, digit],
+  };
+}
+
 export const KEY_ROWS: KeyDef[][] = [
+  [multiTap("1", ".,?!"), multiTap("2", "abc"), multiTap("3", "def")],
+  [multiTap("4", "ghi"), multiTap("5", "jkl"), multiTap("6", "mno")],
+  [multiTap("7", "pqrs"), multiTap("8", "tuv"), multiTap("9", "wxyz")],
   [
-    { id: "q", label: "Q" },
-    { id: "w", label: "W" },
-    { id: "e", label: "E" },
-    { id: "r", label: "R" },
-    { id: "t", label: "T" },
-    { id: "y", label: "Y" },
-    { id: "u", label: "U" },
-    { id: "i", label: "I" },
-    { id: "o", label: "O" },
-    { id: "p", label: "P" },
-    { id: "backspace", label: "del", width: 1.5 },
-  ],
-  [
-    { id: "a", label: "A" },
-    { id: "s", label: "S" },
-    { id: "d", label: "D" },
-    { id: "f", label: "F" },
-    { id: "g", label: "G" },
-    { id: "h", label: "H" },
-    { id: "j", label: "J" },
-    { id: "k", label: "K" },
-    { id: "l", label: "L" },
-  ],
-  [
-    { id: "z", label: "Z" },
-    { id: "x", label: "X" },
-    { id: "c", label: "C" },
-    { id: "v", label: "V" },
-    { id: "b", label: "B" },
-    { id: "n", label: "N" },
-    { id: "m", label: "M" },
-    { id: ",", label: "," },
-    { id: ".", label: "." },
-  ],
-  [
-    { id: "space", label: "space", insert: " ", width: 6 },
-    { id: "enter", label: "enter", insert: "\n", width: 1.8 },
+    { id: "backspace", label: "del", sub: "back" },
+    { id: "space", label: "0", sub: "space", insert: " " },
+    { id: "enter", label: "enter", sub: "new line", insert: "\n" },
   ],
 ];
 
@@ -52,21 +32,42 @@ export function applyKey(text: string, key: KeyDef) {
   return text + (key.insert ?? key.label.toLowerCase());
 }
 
+export type Cycle = { keyId: string; index: number; at: number };
+
+// Multi-tap: re-firing the same key within the window replaces the pending
+// character with the next one on that key; otherwise a new character starts.
+export function nextCycle(
+  key: KeyDef,
+  cycle: Cycle | null,
+  continuing: boolean,
+  now: number,
+): { cycle: Cycle; replace: boolean } {
+  const count = key.chars?.length ?? 1;
+  if (cycle && cycle.keyId === key.id && continuing) {
+    return {
+      cycle: { keyId: key.id, index: (cycle.index + 1) % count, at: now },
+      replace: true,
+    };
+  }
+  return { cycle: { keyId: key.id, index: 0, at: now }, replace: false };
+}
+
 export function findKey(id: string) {
   return KEY_ROWS.flat().find((key) => key.id === id) ?? null;
 }
 
+// Mirrors WebGazer's 9-point calibration: outer points first, centre last.
+// The centre key doubles as the accuracy-measurement target.
 export const CALIBRATION_KEYS = [
-  "q",
-  "t",
+  "1",
+  "2",
+  "3",
+  "4",
+  "6",
   "backspace",
-  "a",
-  "g",
-  "l",
-  "z",
-  "b",
-  ".",
   "space",
+  "enter",
+  "5",
 ] as const;
 
 export function keyCenter(id: string, nodes: Map<string, HTMLElement>) {
@@ -76,79 +77,50 @@ export function keyCenter(id: string, nodes: Map<string, HTMLElement>) {
   return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 }
 
+// Fraction of a key's size the gaze may drift past its edge before we let go
+// of it. Vertical gets more slack because the vertical estimate is noisier.
+const HOLD_MARGIN_X = 0.25;
+const HOLD_MARGIN_Y = 0.45;
+// Beyond this normalised distance from every key (e.g. reading the output
+// box), nothing is selected.
+const MAX_SNAP_DISTANCE = 2;
+
+// Snaps the gaze point to the nearest key, measured in units of half the key
+// size so tall and wide keys are treated alike. The current key is kept while
+// the gaze stays inside its slightly enlarged box, which stops flicker at
+// borders.
 export function pickGazeKey(
   x: number,
   y: number,
   currentId: string | null,
   nodes: Map<string, HTMLElement>,
 ) {
-  const rowMeta = KEY_ROWS.map((row, index) => {
-    const rects = row
-      .map((key) => nodes.get(key.id)?.getBoundingClientRect())
-      .filter((rect): rect is DOMRect => Boolean(rect));
-    if (rects.length === 0) return null;
-    const yMid =
-      rects.reduce((sum, rect) => sum + rect.top + rect.height / 2, 0) /
-      rects.length;
-    const height = Math.max(...rects.map((rect) => rect.height));
-    return { index, yMid, height };
-  }).filter((row): row is { index: number; yMid: number; height: number } =>
-    Boolean(row),
-  );
-
-  if (rowMeta.length === 0) return null;
-
-  let currentRow =
-    currentId == null
-      ? null
-      : KEY_ROWS.findIndex((row) => row.some((key) => key.id === currentId));
-  if (currentRow === -1) currentRow = null;
-
-  const containing = rowMeta.filter(
-    (row) => Math.abs(y - row.yMid) <= row.height / 2,
-  );
-
-  let chosenRow = containing[0] ?? null;
-  if (containing.length > 1) {
-    chosenRow = containing.reduce((best, row) =>
-      Math.abs(y - row.yMid) < Math.abs(y - best.yMid) ? row : best,
-    );
-  }
-
-  if (!chosenRow && currentRow != null) {
-    const current = rowMeta.find((row) => row.index === currentRow);
-    if (current && Math.abs(y - current.yMid) <= current.height * 0.7) {
-      chosenRow = current;
+  if (currentId) {
+    const rect = nodes.get(currentId)?.getBoundingClientRect();
+    if (
+      rect &&
+      x >= rect.left - rect.width * HOLD_MARGIN_X &&
+      x <= rect.right + rect.width * HOLD_MARGIN_X &&
+      y >= rect.top - rect.height * HOLD_MARGIN_Y &&
+      y <= rect.bottom + rect.height * HOLD_MARGIN_Y
+    ) {
+      return currentId;
     }
   }
 
-  if (!chosenRow) return null;
-
-  const row = KEY_ROWS[chosenRow.index];
   let bestId: string | null = null;
   let bestDist = Infinity;
-  let currentDist = Infinity;
-
-  for (const key of row) {
-    const node = nodes.get(key.id);
-    if (!node) continue;
-    const rect = node.getBoundingClientRect();
-    const cx = rect.left + rect.width / 2;
-    const dist = Math.abs(x - cx) / Math.max(rect.width / 2, 1);
-    if (key.id === currentId) currentDist = dist;
+  for (const key of KEY_ROWS.flat()) {
+    const rect = nodes.get(key.id)?.getBoundingClientRect();
+    if (!rect) continue;
+    const dx = (x - (rect.left + rect.width / 2)) / Math.max(rect.width / 2, 1);
+    const dy = (y - (rect.top + rect.height / 2)) / Math.max(rect.height / 2, 1);
+    const dist = Math.max(Math.abs(dx), Math.abs(dy));
     if (dist < bestDist) {
       bestDist = dist;
       bestId = key.id;
     }
   }
 
-  if (
-    currentId &&
-    row.some((key) => key.id === currentId) &&
-    currentDist < bestDist * 1.45
-  ) {
-    return currentId;
-  }
-
-  return bestDist > 1.7 ? currentId : bestId;
+  return bestDist > MAX_SNAP_DISTANCE ? null : bestId;
 }

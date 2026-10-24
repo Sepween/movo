@@ -24,3 +24,14 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* WebGazer injects its camera preview with inline fixed positioning at 0,0. */
+#webgazerVideoContainer {
+  top: 12px !important;
+  left: 12px !important;
+  z-index: 40 !important;
+  overflow: hidden;
+  border-radius: 16px;
+  box-shadow: 0 10px 25px rgb(0 0 0 / 0.35);
+  pointer-events: none;
+}
