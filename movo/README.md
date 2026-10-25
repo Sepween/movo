@@ -1,6 +1,6 @@
 # movo (web app)
 
-The Movo web app. See the [main README](../README.md) for what it does and how it works.
+The movo web app. See the [main README](../README.md) for what it does and how it works.
 
 ```bash
 npm install

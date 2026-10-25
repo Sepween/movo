@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Movo",
+  title: "movo",
   description: "Type and speak with small head movements.",
   icons: { icon: "/icon.png", apple: "/icon.png" },
 };

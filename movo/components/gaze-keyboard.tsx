@@ -1606,7 +1606,7 @@ function IntroScreen({ leaving }: { leaving: boolean }) {
         className="h-auto w-[min(26rem,70vw)]"
       />
       <p className="max-w-xl text-lg leading-8 text-[#3d4556] sm:text-xl sm:leading-9">
-        Movo lets you type and speak with small head movements. Point with
+        movo lets you type and speak with small head movements. Point with
         your nose, hold on a key to press it, and wink your left eye to pause.
       </p>
       <p className="text-sm tracking-[0.25em] text-[#8a7f68] uppercase">
@@ -2037,7 +2037,7 @@ function TutorialModal({ closeButton }: { closeButton: ReactNode }) {
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#0b1220]/35 p-4 backdrop-blur-[2px]">
       <div
         role="dialog"
-        aria-label="How to use Movo"
+        aria-label="How to use movo"
         className="flex max-h-full w-full max-w-3xl flex-col gap-6 overflow-y-auto rounded-3xl border border-[#0b1220]/10 bg-[#fffdf8] p-6 shadow-2xl sm:p-8"
       >
         <div className="flex items-start justify-between gap-4">
@@ -2046,7 +2046,7 @@ function TutorialModal({ closeButton }: { closeButton: ReactNode }) {
               Quick tour
             </p>
             <h1 className="mt-1 text-4xl font-semibold tracking-tight">
-              How to use Movo
+              How to use movo
             </h1>
             <p className="mt-1 text-[#5b6577]">
               Point at ✕ and hold to close.

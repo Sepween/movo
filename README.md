@@ -14,26 +14,26 @@
 
 ---
 
-## Why Movo
+## Why movo
 
 People who can't speak or use their hands, for example after a stroke, or living with ALS, cerebral palsy or a spinal cord injury, often rely on **AAC** (augmentative and alternative communication) systems to talk. Many of these systems are expensive, need dedicated hardware, and speak in the same flat, generic voice for everyone.
 
-**Movo** is a more personal AAC system. You point with your nose, hold on a key to press it, and wink to control the app, with no hands, no special hardware and no clicking. What you type is read aloud in a voice you choose, including a clone of your own voice or a loved one's. The keyboard learns the words that matter to you, and adjusts to how much you're able to move.
+**movo** is a more personal AAC system. You point with your nose, hold on a key to press it, and wink to control the app, with no hands, no special hardware and no clicking. What you type is read aloud in a voice you choose, including a clone of your own voice or a loved one's. The keyboard learns the words that matter to you, and adjusts to how much you're able to move.
 
 ## Features
 
 ### Hands-free control
 - **Head pointer.** Your nose is the cursor. Tracking runs from an ordinary webcam.
 - **Point and hold to press.** Rest the pointer on a button for about a second; a fill bar shows the press coming.
-- **Snapping buttons.** The pointer snaps to whichever button it's over, and stays on it until you move clearly past the edge, so small head jitter doesn't drop or switch your target. This applies to every button in the app.
-- **Left wink** pauses and resumes the keyboard. **Right wink** switches between the two typing modes. Ordinary blinks are ignored.
-- **Fully hands-free calibration.** Turn toward each highlighted key and hold still; it records by itself. Then a guided wink calibration (both eyes open, left wink, right wink) learns your eyes, followed by a 5-second accuracy check.
+- **Snapping buttons.** The pointer automatically snaps to whichever button it's over to allow for more stable button selection.
+- **Left wink** pauses and resumes the keyboard. **Right wink** switches between the two typing modes.
+- **Fully hands-free calibration.** A comprehensive calibration process leading to a smoother experience.
 
 ### Typing
-- **T9 keypad.** A 3×4 phone-style layout with large keys. Letters are shown big, with the digit small underneath.
-- **Predictive mode.** Press each letter's key once (`4-6-6-3`) and pick the word you meant (`good`, `home`, `gone`…) from a suggestion row. Arrows page through more suggestions.
+- **T9 keypad.** A 3×4 phone-style layout with large keys.
+- **Predictive mode.** Press each letter's key once and pick the word you meant from a suggestion row. Arrows flip through pages for more suggestions.
 - **Multi-tap mode.** For exact spelling: keep pointing at a key to cycle through its letters (`a → b → c → 2`).
-- **Consecutive typing.** Keep pointing at a key and it presses again every 0.9s, so you don't have to look away and come back to type `222`. The suggestion arrows also repeat while held.
+- **Consecutive typing.** Keep pointing at a key and it presses again every 0.9s.
 - **Adaptive delete.** Holding delete removes one character, then speeds up the longer you hold, and after a few seconds deletes whole words.
 - **Text box tools** beside the box:
   - **Eraser** clears everything.
@@ -42,13 +42,15 @@ People who can't speak or use their hands, for example after a stroke, or living
 - **Scrolling text box.** Point at the top or bottom strip of the text box and hold to scroll through longer messages.
 
 ### Personalization (Settings)
-Pause with a left wink, then point at **Settings**. Patient options are point-and-hold; caretaker options are ordinary mouse clicks.
+Pause with a left wink, then point at **Settings**. Patient options are point-and-hold, caretaker options are ordinary mouse clicks.
 
 | Section | Patient (point and hold) | Caretaker (mouse) |
 |---|---|---|
-| **Voices** | Choose the speaking voice (up to 9) | Add a voice from an audio or `.mp4` recording |
+| **Voices** | Choose the speaking voice | Add a voice from an audio file |
 | **Vocabularies** | n/a | View, add, respell and delete personal words |
-| **Others** | Pointer sensitivity (0.5× to 1.5×), recalibrate | Switch to eye tracking |
+| **Others** | Pointer sensitivity (0.5× to 1.5×), recalibrate | Switch to eye tracking* |
+
+<sub>\* Eye tracking mode is a placeholder for future work and isn't fully implemented yet. It's there so movo can later support people who use a dedicated hardware eye tracker, for whom eye tracking may work better than head movement.</sub>
 
 Settings and personal words are saved in the browser, so they're still there next time.
 
@@ -66,7 +68,7 @@ A full QWERTY keyboard packs 26+ small keys across the screen. Webcam head track
 ### AAC voices sound flat and impersonal
 AAC users often say their system reads their words plainly, with no emotion, in a voice that isn't theirs.
 
-**Our solution:** **swappable, cloneable voices.** A caretaker uploads a short recording, of the user's own voice from before they lost speech or of a family member, and Movo clones it with ElevenLabs. Everything typed is then read aloud in that voice, with natural expression.
+**Our solution:** **swappable, cloneable voices.** A caretaker uploads a short recording, of the user's own voice from before they lost speech or of a family member, and movo clones it with ElevenLabs. Everything typed is then read aloud in that voice, with natural expression.
 
 ### The words that matter most are often the ones no dictionary has
 Names of loved ones, pets, places and in-jokes usually aren't in any word list. Typing them letter by letter every time is slow and frustrating, especially for words someone uses every day.
@@ -78,9 +80,6 @@ Some people prefer a calm, precise pointer. Others can only turn their head a li
 
 **Our solution:** **adjustable pointer sensitivity** from 0.5× to 1.5×, chosen hands-free in Settings and remembered between sessions.
 
-### Patients can't use their hands, even to set up
-**Our solution:** everything the patient needs is controlled by head and eyes, including calibration, recalibration, pausing and settings. Only optional caretaker tasks (uploading voices, editing the vocabulary) use a mouse.
-
 ## How it works
 
 | Part | Technology |
@@ -88,16 +87,15 @@ Some people prefer a calm, precise pointer. Others can only turn their head a li
 | Head and face tracking | **Google MediaPipe Face Landmarker** (`@mediapipe/tasks-vision`), in the browser |
 | Text to speech and voice cloning | **ElevenLabs** API (`eleven_multilingual_v2`, instant voice cloning) |
 | App | Next.js 16, React 19, TypeScript, Tailwind CSS 4 |
-| Optional eye tracking | WebGazer.js |
+| Eye tracking (placeholder) | WebGazer.js, standing in until hardware eye trackers are supported |
 
 **Head pointer**
 - MediaPipe finds 478 face landmarks in every webcam frame, on the GPU, falling back to the CPU if needed.
-- Movo estimates head turn and tilt from the nose tip's position relative to the outer eye corners, measured relative to the distance between the eyes. That keeps it stable when you lean in or move sideways.
+- movo estimates head turn and tilt from the nose tip's position relative to the outer eye corners, measured relative to the distance between the eyes. That keeps it stable when you lean in or move sideways.
 - A short calibration (5 keys) fits a per-user mapping from head pose to screen position. A One Euro filter smooths the pointer while you're still and keeps it responsive when you move.
 
 **Winks**
-- Each frame, Movo measures how open each eye is (eye aspect ratio) and compares the two eyes with each other, not with a fixed level.
-- A blink closes both eyes together, so it's ignored. A wink makes the eyes differ, even if the open eye squints along.
+- Each frame, movo measures how open each eye is (eye aspect ratio) and compares the two eyes with each other.
 - Per-user thresholds come from the wink calibration. Without calibration, a 30% difference counts.
 
 **Speech**
@@ -113,7 +111,7 @@ Some people prefer a calm, precise pointer. Others can only turn their head a li
 - Only the text being spoken, and any voice recordings a caretaker uploads, are sent to ElevenLabs.
 - Settings and personal words are stored in the browser's local storage.
 
-## Getting started
+## Run it locally
 
 **Requirements:** Node.js 20+, a webcam, a recent Chrome or Edge, and an [ElevenLabs API key](https://elevenlabs.io) for speech.
 
@@ -142,8 +140,6 @@ Open http://localhost:3000 and allow camera access.
 - Keep the webcam roughly at eye level.
 - If the pointer drifts, pause and recalibrate from Settings → Others.
 
-Camera access needs `localhost` or HTTPS, so deploy behind HTTPS.
-
 ## Project structure
 
 ```
@@ -160,7 +156,7 @@ movo/
 │   ├── t9.ts                 # Word bank, suggestions, personal vocabulary
 │   ├── voice.tsx             # Voice list, selection, upload
 │   ├── speech.ts             # Read-aloud hook
-│   └── webgazer.ts           # Optional eye-tracking mode
+│   └── webgazer.ts           # Placeholder eye-tracking mode
 └── public/
     ├── t9/                   # Word lists (+ licence)
     └── webgazer/             # WebGazer bundle (+ licence)
@@ -168,11 +164,9 @@ movo/
 
 ## Limitations and next steps
 
-- **Lighting and camera:** tracking accuracy depends on lighting and webcam quality.
 - **Desktop only:** built and tested on laptops and desktops with Chrome. Mobile isn't supported yet.
-- **Data stays on one browser:** settings and personal words are saved per browser and don't sync between devices.
 - **English only:** the word bank is English.
-- **Stays inside Movo:** you can't type into other apps or websites yet. A browser extension or desktop app would let Movo type anywhere.
+- **Stays inside movo:** you can't type into other apps or websites yet. A browser extension or desktop app would let movo type anywhere.
 
 ## Credits and licences
 
@@ -180,8 +174,8 @@ movo/
 - [ElevenLabs](https://elevenlabs.io) for speech and voice cloning.
 - Full word bank from [dwyl/english-words](https://github.com/dwyl/english-words) (Unlicense).
 - Common-word list derived from the Google Web Trillion Word Corpus. It's licensed for research and educational use; see `movo/public/t9/LICENSE.md`.
-- [WebGazer.js](https://webgazer.cs.brown.edu) (GPLv3 / LGPLv3) for the optional eye-tracking mode; see `movo/public/webgazer/LICENSE.md`.
+- [WebGazer.js](https://webgazer.cs.brown.edu) (GPLv3 / LGPLv3) for the placeholder eye-tracking mode; see `movo/public/webgazer/LICENSE.md`.
 
 ## Team
 
-Movo is built by **Shrenik Patel**, **Yifei Peng** and **Jiahui Zhu**.
+movo is built by **Shrenik Patel**, **Yifei Peng** and **Jiahui Zhu**.
