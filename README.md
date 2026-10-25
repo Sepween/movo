@@ -14,6 +14,15 @@
 
 ---
 
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/cropped/title_page.png" alt="Intro screen" width="49%" />
+  <img src="screenshots/cropped/calibration_1.png" alt="Calibration" width="49%" />
+  <img src="screenshots/cropped/calibration_2.png" alt="Calibration" width="49%" />
+  <img src="screenshots/cropped/keyboard_page.png" alt="Keyboard" width="49%" />
+</p>
+
 ## Why movo
 
 People who can't speak or use their hands, for example after a stroke, or living with ALS, cerebral palsy or a spinal cord injury, often rely on **AAC** (augmentative and alternative communication) systems to talk. Many of these systems are expensive, need dedicated hardware, and speak in the same flat, generic voice for everyone.
