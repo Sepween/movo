@@ -17,10 +17,10 @@
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/cropped/title_page.png" alt="Intro screen" width="49%" />
-  <img src="screenshots/cropped/calibration_1.png" alt="Calibration" width="49%" />
-  <img src="screenshots/cropped/calibration_2.png" alt="Calibration" width="49%" />
-  <img src="screenshots/cropped/keyboard_page.png" alt="Keyboard" width="49%" />
+  <img src="screenshots/title_page.png" alt="Intro screen" width="49%" />
+  <img src="screenshots/calibration_1.png" alt="Calibration" width="49%" />
+  <img src="screenshots/calibration_2.png" alt="Calibration" width="49%" />
+  <img src="screenshots/keyboard_page.png" alt="Keyboard" width="49%" />
 </p>
 
 ## Why movo
