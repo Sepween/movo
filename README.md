@@ -56,7 +56,7 @@ Pause with a left wink, then point at **Settings**. Patient options are point-an
 | Section | Patient (point and hold) | Caretaker (mouse) |
 |---|---|---|
 | **Voices** | Choose the speaking voice | Add a voice from an audio file |
-| **Vocabularies** | n/a | View, add, respell and delete personal words |
+| **Vocabularies** | Add personal words | View, add, respell and delete personal words |
 | **Others** | Pointer sensitivity (0.5× to 1.5×), recalibrate | Switch to eye tracking* |
 
 <sub>\* Eye tracking mode is a placeholder for future work and isn't fully implemented yet. It's there so movo can later support people who use a dedicated hardware eye tracker, for whom eye tracking may work better than head movement.</sub>
