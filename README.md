@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://example.com/movo-demo">▶ Watch the demo</a> ·
-  <a href="#getting-started">Run it locally</a>
+  <a href="#run-it-locally">Run it locally</a>
 </p>
 
 ---
